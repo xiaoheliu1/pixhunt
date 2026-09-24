@@ -1,5 +1,10 @@
 # pixhunt
 
+[![CI](https://github.com/xiaoheliu1/pixhunt/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaoheliu1/pixhunt/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/pixhunt.svg)](https://crates.io/crates/pixhunt)
+[![docs.rs](https://img.shields.io/docsrs/pixhunt)](https://docs.rs/pixhunt)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可)
+
 > 快速、低依赖的**屏幕找图**库:截一帧屏幕,在其中定位一张小图(模板)的坐标。
 > 纯 Rust,无需 OpenCV。适合自动化测试、脚本辅助、UI 定位等。
 

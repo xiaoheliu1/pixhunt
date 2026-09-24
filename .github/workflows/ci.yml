@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (default features)
+        run: cargo build --release
+
+      - name: Test (default features)
+        run: cargo test --release
+
+      - name: Test (all features) [windows]
+        if: matrix.os == 'windows-latest'
+        run: cargo test --release --all-features
+
+      - name: Test (match-corr) [linux]
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --release --features match-corr
