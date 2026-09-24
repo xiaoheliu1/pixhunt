@@ -1,0 +1,40 @@
+[package]
+name = "pixhunt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Fast, low-dependency screen template matching: capture the screen and locate a small image, with pluggable capture backends (GDI / DXGI) and matchers (RGB / ZNCC)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xiaoheliu1/pixhunt"
+readme = "README.md"
+keywords = ["template-matching", "screenshot", "computer-vision", "automation", "image-search"]
+categories = ["computer-vision", "multimedia::images", "os"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+screenshots = "0.8"
+corrmatch = { version = "0.1", features = ["simd"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.51", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[features]
+default = []
+# 高性能截图后端(仅 Windows):
+capture-gdi = ["dep:windows"]
+capture-dxgi = ["dep:windows"]
+# 高鲁棒匹配器(基于 corrmatch 的 ZNCC,跨平台):
+match-corr = ["dep:corrmatch"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
