@@ -37,11 +37,13 @@ if let Some(m) = finder.find_on_screen(&tpl)? {
 | (默认) | `ScreenshotsCapture` + `RgbMatcher` | 跨平台 |
 | `capture-gdi` | `GdiCapture`(复用 DC + BitBlt,输出 BGRA) | 仅 Windows |
 | `capture-dxgi` | `DxgiCapture`(桌面复制,GPU 取帧) | 仅 Windows |
+| `capture-window` | `WindowCapture`(PrintWindow 截单个窗口客户区,遮挡也可截) | 仅 Windows |
 | `match-corr` | `CorrMatcher`(corrmatch 的 ZNCC,灰度) | 跨平台 |
+| `parallel` | `RgbMatcher` 按行并行(find / find_all,rayon) | 跨平台 |
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.1", features = ["capture-dxgi", "capture-gdi", "match-corr"] }
+pixhunt = { version = "0.3", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
 ```
 
 启用后 `CaptureKind` 多出 `Gdi` / `Dxgi` / `Auto`(`Auto` 依次试 DXGI → GDI → screenshots),
@@ -65,6 +67,59 @@ let mut finder = Finder::builder()
 | --- | --- | --- |
 | `Rgb` | 屏幕内容与模板几乎一致、追求速度 | 不转灰度、锚点 + 逐像素早失败,通道序自适应(RGBA/BGRA) |
 | `Corr` | 有光照/轻微缩放变化、追求稳 | 灰度 ZNCC + 金字塔,较慢但鲁棒 |
+
+## 更多用法 (v0.2)
+```rust
+use pixhunt::{Finder, CaptureKind, MatchKind, Template, Rect};
+
+// 1) 限定区域:只在该矩形内找,返回的仍是屏幕绝对坐标
+let finder = Finder::builder()
+    .capture(CaptureKind::Auto)
+    .matcher(MatchKind::Rgb { tolerance: 25 })
+    .region(Rect::new(100, 80, 640, 480))
+    .build()?;
+
+// 2) 多结果:找全部不重叠匹配(重叠自动去重),max=0 表示不限
+let all = finder.find_all_on_screen(&tpl, 0)?;
+
+// 3) 批量:只截一屏,一次匹配多张模板(省掉重复截图)
+let hits = finder.find_many_on_screen(&[&tpl_a, &tpl_b, &tpl_c])?;
+```
+
+匹配器层面也可直接调用 trait 方法:
+[`Matcher::find`] 整帧单个、[`Matcher::find_in`] 区域内单个、
+[`Matcher::find_all`] 区域内多个。开启 `parallel` 后,`RgbMatcher` 用 rayon 把
+扫描按行分到多核,全屏 `find` / `find_all` 在大分辨率下更快(结果与串行完全一致)。
+
+## 等待与窗口 (v0.3)
+```rust
+use std::time::Duration;
+use pixhunt::{Finder, CaptureKind, MatchKind, Template, WindowCapture};
+
+// 4) 轮询等待:等按钮出现(命中即返回,超时返回 None);等遮罩消失同理。
+//    配合 DXGI 后端的"静态帧跳过",等待期间几乎零开销。
+let m = finder.find_until(&tpl, Duration::from_secs(10), Duration::from_millis(50))?;
+let gone = finder.wait_gone(&loading_tpl, Duration::from_secs(30), Duration::from_millis(100))?;
+
+// 5) 窗口级截图(Windows, feature `capture-window`):PrintWindow 渲染客户区,
+//    窗口被遮挡也能截;返回坐标为窗口相对。也可用 CaptureKind::Window(hwnd)。
+let cap = WindowCapture::from_title("无标题 - 记事本")?;
+let mut finder = Finder::new(Box::new(cap), Box::new(pixhunt::RgbMatcher::new(25)));
+let m = finder.find_on_screen(&tpl)?; // 相对该窗口客户区的坐标
+```
+
+## 与键鼠操作的关系(生态分工)
+pixhunt 专注做**眼睛**(截图 + 定位),不做"手"——点击/输入交给
+[enigo](https://crates.io/crates/enigo)、[rdev](https://crates.io/crates/rdev)
+等成熟跨平台库,坐标就是两者的接口:
+
+```rust,ignore
+let m = finder.find_until(&button, Duration::from_secs(10), Duration::from_millis(80))?.unwrap();
+enigo.move_mouse(m.x + button.width as i32 / 2, m.y + button.height as i32 / 2, Coordinate::Abs)?;
+enigo.button(Button::Left, Direction::Click)?;
+```
+
+完整可运行示例见 `examples/wait_and_click.rs`(Windows,`--features capture-gdi`)。
 
 ## 性能(参考)
 以下数字来自同仓库的 benchmark(1920x1200 / release / 全屏),用来说明**各后端的

@@ -3,12 +3,16 @@
 //! 快速、低依赖的**屏幕找图**库:截一帧屏幕,在其中定位一张小图(模板)的坐标。
 //!
 //! 两个"可插拔插座":
-//! - [`Capture`]  —— 怎么拿到画面:`ScreenshotsCapture`(跨平台保底),
-//!   以及 Windows 上更快的 `GdiCapture` / `DxgiCapture`(feature 门控)。
-//! - [`Matcher`]  —— 怎么找模板:内置极速 [`RgbMatcher`],以及基于 corrmatch 的
-//!   高鲁棒 ZNCC `CorrMatcher`(feature `match-corr`)。
+//! - [`Capture`](capture::Capture) —— 怎么拿到画面:跨平台的 `ScreenshotsCapture`,
+//!   以及 Windows 上更快的 `GdiCapture` / `DxgiCapture` 与截单个窗口的
+//!   `WindowCapture`(feature 门控)。
+//! - [`Matcher`](matcher::Matcher) —— 怎么找模板:内置极速 [`RgbMatcher`](matcher::RgbMatcher)
+//!   (支持容差),以及基于 corrmatch 的高鲁棒 ZNCC `CorrMatcher`(feature `match-corr`)。
 //!
-//! 快速上手见 `examples/find_on_screen.rs` 与 README。
+//! 常用能力:整屏查找 [`Finder::find_on_screen`]、限定区域查找
+//! [`Matcher::find_in`]、多结果 [`Matcher::find_all`]、一次截图匹配多模板
+//! [`Finder::find_many_on_screen`]、轮询等待出现/消失 [`Finder::find_until`] /
+//! [`Finder::wait_gone`]。开 feature `parallel` 可用 rayon 按行并行加速。
 //!
 //! ```no_run
 //! use pixhunt::{Finder, CaptureKind, MatchKind, Template};
@@ -40,6 +44,11 @@ mod capture_dxgi;
 #[cfg(all(windows, feature = "capture-dxgi"))]
 pub use capture_dxgi::DxgiCapture;
 
+#[cfg(all(windows, feature = "capture-window"))]
+mod capture_window;
+#[cfg(all(windows, feature = "capture-window"))]
+pub use capture_window::{WindowCapture, WindowHandle};
+
 #[cfg(feature = "match-corr")]
 mod matcher_corr;
 #[cfg(feature = "match-corr")]
@@ -48,6 +57,6 @@ pub use matcher_corr::CorrMatcher;
 pub use capture::{Capture, ScreenshotsCapture};
 pub use error::{Error, Result};
 pub use finder::{CaptureKind, Finder, MatchKind};
-pub use frame::{Frame, PixelFormat};
+pub use frame::{Frame, PixelFormat, Rect};
 pub use matcher::{Match, Matcher, RgbMatcher};
 pub use template::Template;

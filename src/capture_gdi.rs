@@ -1,5 +1,6 @@
-//! Windows GDI 截图后端:复用 DC/位图/buffer + BitBlt(1:1) + 负 biHeight 免翻转,
-//! 输出 **BGRA**。相比 `screenshots` 库消除了每帧重建对象与多次全帧拷贝的开销。
+//! Windows GDI 截图后端:复用 DC/位图 + BitBlt(1:1) + 负 biHeight 免翻转,
+//! 输出 **BGRA**。相比 `screenshots` 库消除了每帧重建对象的开销;`grab_into`
+//! 更把像素直接 `GetDIBits` 写进调用方缓冲,连内部中转 buffer 都省了。
 
 use crate::capture::Capture;
 use crate::frame::Frame;
@@ -8,9 +9,9 @@ use crate::Result;
 use std::ffi::c_void;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, DIB_RGB_COLORS,
-    GetDC, GetDIBits, GetDeviceCaps, HORZRES, ReleaseDC, SelectObject, SRCCOPY, VERTRES,
-    BITMAPINFO, BITMAPINFOHEADER, HBITMAP, HDC, HGDIOBJ,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    GetDeviceCaps, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
+    HDC, HGDIOBJ, HORZRES, SRCCOPY, VERTRES,
 };
 
 /// 复用型 GDI 抓屏器(内部对象只建一次)。
@@ -21,7 +22,6 @@ struct FastCap {
     old: HGDIOBJ,
     w: usize,
     h: usize,
-    buf: Vec<u8>,
     bmi: BITMAPINFO,
 }
 
@@ -43,12 +43,24 @@ impl FastCap {
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = 0; // BI_RGB
 
-            Self { hdc_screen, hdc_mem, hbmp, old, w, h, buf: vec![0u8; w * h * 4], bmi }
+            Self {
+                hdc_screen,
+                hdc_mem,
+                hbmp,
+                old,
+                w,
+                h,
+                bmi,
+            }
         }
     }
 
-    /// 抓一帧,返回 (BGRA 切片, w, h);复用内部 buffer。
-    fn grab(&mut self) -> (&[u8], usize, usize) {
+    fn size(&self) -> (usize, usize) {
+        (self.w, self.h)
+    }
+
+    /// 抓一帧,BGRA 直接写入 `dst`(`dst` 长度会被设为 `w*h*4`)。
+    fn grab_into(&mut self, dst: &mut Vec<u8>) {
         unsafe {
             let _ = BitBlt(
                 self.hdc_mem,
@@ -66,12 +78,11 @@ impl FastCap {
                 self.hbmp,
                 0,
                 self.h as u32,
-                Some(self.buf.as_mut_ptr() as *mut c_void),
+                Some(dst.as_mut_ptr() as *mut c_void),
                 &mut self.bmi,
                 DIB_RGB_COLORS,
             );
             assert!(ret != 0, "GetDIBits 失败");
-            (&self.buf, self.w, self.h)
         }
     }
 }
@@ -95,13 +106,24 @@ pub struct GdiCapture {
 impl GdiCapture {
     /// 在主显示器上创建(仅 Windows)。
     pub fn new_primary() -> Self {
-        GdiCapture { inner: FastCap::new_primary() }
+        GdiCapture {
+            inner: FastCap::new_primary(),
+        }
     }
 }
 
 impl Capture for GdiCapture {
     fn grab(&mut self) -> Result<Frame> {
-        let (bgra, w, h) = self.inner.grab();
-        Ok(Frame::bgra8(w, h, bgra.to_vec()))
+        let (w, h) = self.inner.size();
+        let mut pixels = vec![0u8; w * h * 4];
+        self.inner.grab_into(&mut pixels);
+        Ok(Frame::bgra8(w, h, pixels))
+    }
+
+    fn grab_into(&mut self, dst: &mut Frame) -> Result<bool> {
+        let (w, h) = self.inner.size();
+        dst.prepare_bgra(w, h);
+        self.inner.grab_into(&mut dst.pixels);
+        Ok(true) // GDI 无从判断画面是否变化,保守视为已变
     }
 }

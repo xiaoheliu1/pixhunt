@@ -1,6 +1,6 @@
 [package]
 name = "pixhunt"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Fast, low-dependency screen template matching: capture the screen and locate a small image, with pluggable capture backends (GDI / DXGI) and matchers (RGB / ZNCC)."
@@ -14,6 +14,7 @@ categories = ["computer-vision", "multimedia::images", "os"]
 image = { version = "0.25", default-features = false, features = ["png"] }
 screenshots = "0.8"
 corrmatch = { version = "0.1", features = ["simd"], optional = true }
+rayon = { version = "1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.51", optional = true, features = [
@@ -23,18 +24,34 @@ windows = { version = "0.51", optional = true, features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Storage_Xps",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+# 仅示例 wait_and_click 使用:演示"pixhunt 看 + enigo 点"的分工,不进库依赖。
+[target.'cfg(windows)'.dev-dependencies]
+enigo = "0.6"
+
+[[bench]]
+name = "match"
+harness = false
 
 [features]
 default = []
-# 高性能截图后端(仅 Windows):
 capture-gdi = ["dep:windows"]
 capture-dxgi = ["dep:windows"]
-# 高鲁棒匹配器(基于 corrmatch 的 ZNCC,跨平台):
+capture-window = ["dep:windows"]
 match-corr = ["dep:corrmatch"]
+parallel = ["dep:rayon"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-

@@ -16,7 +16,11 @@ impl Template {
         let img = image::open(path)?;
         let rgb = img.to_rgb8();
         let (width, height) = (rgb.width() as usize, rgb.height() as usize);
-        Ok(Template { rgb: rgb.into_raw(), width, height })
+        Ok(Template {
+            rgb: rgb.into_raw(),
+            width,
+            height,
+        })
     }
 
     /// 从已有 RGB 字节构造。
@@ -25,16 +29,24 @@ impl Template {
         Template { rgb, width, height }
     }
 
+    /// 内容指纹(尺寸 + 像素哈希)。用于匹配器缓存预计算结果,内容变则失效。
+    pub fn content_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.width.hash(&mut h);
+        self.height.hash(&mut h);
+        self.rgb.hash(&mut h);
+        h.finish()
+    }
+
     /// 转成单通道灰度(Rec.601 加权),供 ZNCC 等匹配器使用。
     pub fn to_gray(&self) -> Vec<u8> {
-        let n = self.width * self.height;
-        let mut gray = vec![0u8; n];
-        for i in 0..n {
-            let b = i * 3;
-            let r = self.rgb[b] as u32;
-            let g = self.rgb[b + 1] as u32;
-            let bl = self.rgb[b + 2] as u32;
-            gray[i] = ((r * 299 + g * 587 + bl * 114) / 1000) as u8;
+        let mut gray = Vec::with_capacity(self.width * self.height);
+        for px in self.rgb.chunks_exact(3) {
+            let r = px[0] as u32;
+            let g = px[1] as u32;
+            let b = px[2] as u32;
+            gray.push(((r * 299 + g * 587 + b * 114) / 1000) as u8);
         }
         gray
     }

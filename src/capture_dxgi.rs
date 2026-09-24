@@ -1,9 +1,10 @@
-//! Windows DXGI 桌面复制截图后端:GPU 取帧,D3D11 设备/上下文/staging 纹理/buffer
-//! 全部只建一次并复用;每帧只做 AcquireNextFrame → CopyResource → Map → 按行回拷 →
-//! Unmap → ReleaseFrame。输出 **BGRA**。
+//! Windows DXGI 桌面复制截图后端:GPU 取帧,D3D11 设备/上下文/staging 纹理全部
+//! 只建一次并复用;每帧只做 AcquireNextFrame →(仅当有新帧时)CopyResource → Map →
+//! 按行回拷 → Unmap → ReleaseFrame。输出 **BGRA**。
 //!
-//! 注意(桌面复制固有):取帧受显示器刷新率限制,静态桌面在无新帧时 `AcquireNextFrame`
-//! 返回 WAIT_TIMEOUT,此时复用上一次的 staging 内容(仍回拷),因此 `grab` 总返回有效帧。
+//! 桌面复制固有:取帧受刷新率限制,静态桌面 `AcquireNextFrame` 返回 WAIT_TIMEOUT,
+//! 表示"自上次以来画面没变"。据此 [`Capture::grab_into`] 会:不重新回拷、并返回
+//! `changed = false`,让上层安全跳过搜索。
 
 use crate::capture::Capture;
 use crate::frame::Frame;
@@ -11,11 +12,11 @@ use crate::{Error, Result};
 
 use windows::core::ComInterface;
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_HARDWARE};
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
@@ -23,7 +24,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
 };
 
-/// 单次取帧的等待上限(毫秒)。超时则复用上帧,避免静态桌面长时间阻塞。
+/// 单次取帧的等待上限(毫秒)。超时视为"无新帧"。
 const ACQUIRE_TIMEOUT_MS: u32 = 33;
 
 struct DxgiInner {
@@ -33,7 +34,7 @@ struct DxgiInner {
     staging: ID3D11Texture2D,
     w: usize,
     h: usize,
-    buf: Vec<u8>,
+    have_frame: bool,
 }
 
 impl DxgiInner {
@@ -76,7 +77,10 @@ impl DxgiInner {
             desc.MipLevels = 1;
             desc.ArraySize = 1;
             desc.Format = fmt;
-            desc.SampleDesc = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            desc.SampleDesc = DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            };
             desc.Usage = D3D11_USAGE_STAGING;
             desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
 
@@ -91,50 +95,59 @@ impl DxgiInner {
                 staging,
                 w,
                 h,
-                buf: vec![0u8; w * h * 4],
+                have_frame: false,
             })
         }
     }
 
-    /// 抓一帧,把(最新或上一帧)内容回拷进 buffer,返回 (BGRA 切片, w, h)。
-    fn grab(&mut self) -> (&[u8], usize, usize) {
+    /// 抓一帧写进 `dst`。返回 `changed`:自上次以来是否收到新帧
+    /// (`false` 表示画面逐像素未变,`dst` 保留上一帧内容)。
+    fn grab_into(&mut self, dst: &mut Frame) -> bool {
         unsafe {
             let mut res: Option<IDXGIResource> = None;
             let mut fi = std::mem::zeroed::<DXGI_OUTDUPL_FRAME_INFO>();
-            let fresh = match self
-                .duplication
-                .AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &mut fi, &mut res)
-            {
-                Ok(()) => res.is_some(),
-                Err(_) => false,
-            };
+            let fresh =
+                match self
+                    .duplication
+                    .AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &mut fi, &mut res)
+                {
+                    Ok(()) => res.is_some(),
+                    Err(_) => false,
+                };
             if fresh {
                 if let Some(r) = res.take() {
                     if let Ok(tex) = r.cast::<ID3D11Texture2D>() {
                         self.context.CopyResource(&self.staging, &tex);
-                        let _ = self.duplication.ReleaseFrame();
                     }
                 }
+                let _ = self.duplication.ReleaseFrame();
             }
-            let mut mapped = std::mem::zeroed::<D3D11_MAPPED_SUBRESOURCE>();
-            if self
-                .context
-                .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .is_ok()
-            {
-                let src = mapped.pData as *const u8;
-                let row = self.w * 4;
-                let dst = self.buf.as_mut_ptr();
-                for y in 0..self.h {
-                    std::ptr::copy_nonoverlapping(
-                        src.add(y * mapped.RowPitch as usize),
-                        dst.add(y * row),
-                        row,
-                    );
+
+            // 只有收到新帧,或还没抓过任何帧时,才回拷(否则 dst 已是最新)。
+            let need = fresh || !self.have_frame;
+            if need {
+                let mut mapped = std::mem::zeroed::<D3D11_MAPPED_SUBRESOURCE>();
+                if self
+                    .context
+                    .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .is_ok()
+                {
+                    dst.prepare_bgra(self.w, self.h);
+                    let src = mapped.pData as *const u8;
+                    let row = self.w * 4;
+                    let dst_ptr = dst.pixels.as_mut_ptr();
+                    for y in 0..self.h {
+                        std::ptr::copy_nonoverlapping(
+                            src.add(y * mapped.RowPitch as usize),
+                            dst_ptr.add(y * row),
+                            row,
+                        );
+                    }
+                    self.context.Unmap(&self.staging, 0);
+                    self.have_frame = true;
                 }
-                self.context.Unmap(&self.staging, 0);
             }
-            (&self.buf, self.w, self.h)
+            fresh
         }
     }
 }
@@ -153,10 +166,19 @@ impl DxgiCapture {
 
 impl Capture for DxgiCapture {
     fn grab(&mut self) -> Result<Frame> {
-        let (bgra, w, h) = self.inner.grab();
-        if bgra.is_empty() {
+        let mut frame = Frame::bgra8(0, 0, Vec::new());
+        self.inner.grab_into(&mut frame);
+        if frame.pixels.is_empty() {
             return Err(Error::Capture("dxgi returned empty frame".into()));
         }
-        Ok(Frame::bgra8(w, h, bgra.to_vec()))
+        Ok(frame)
+    }
+
+    fn grab_into(&mut self, dst: &mut Frame) -> Result<bool> {
+        let changed = self.inner.grab_into(dst);
+        if dst.pixels.is_empty() {
+            return Err(Error::Capture("dxgi returned empty frame".into()));
+        }
+        Ok(changed)
     }
 }

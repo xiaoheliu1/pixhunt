@@ -19,13 +19,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
 
       - name: Build (default features)
         run: cargo build --release
 
       - name: Test (default features)
         run: cargo test --release
+
+      - name: Test (parallel)
+        run: cargo test --release --features parallel
 
       - name: Test (all features) [windows]
         if: matrix.os == 'windows-latest'
@@ -34,3 +42,14 @@ jobs:
       - name: Test (match-corr) [linux]
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --release --features match-corr
+
+      - name: Clippy (default features)
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Clippy (all features) [windows]
+        if: matrix.os == 'windows-latest'
+        run: cargo clippy --release --all-targets --all-features -- -D warnings
+
+      - name: Clippy (match-corr) [linux]
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --release --all-targets --features match-corr -- -D warnings
