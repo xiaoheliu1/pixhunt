@@ -212,4 +212,8 @@ impl Capture for WindowCapture {
         self.inner.grab_into(&mut dst.pixels)?;
         Ok(true) // PrintWindow 无从判断是否变化,保守视为已变
     }
+
+    fn backend(&self) -> &'static str {
+        "print-window"
+    }
 }

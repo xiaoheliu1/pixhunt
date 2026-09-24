@@ -181,4 +181,8 @@ impl Capture for DxgiCapture {
         }
         Ok(changed)
     }
+
+    fn backend(&self) -> &'static str {
+        "dxgi"
+    }
 }

@@ -1,6 +1,7 @@
 //! 高层封装:把"截图"和"匹配"拼成一步到位的 [`Finder`]。
 
 use crate::capture::{Capture, ScreenshotsCapture};
+use crate::color::{self, ColorBlob, ColorSpec};
 use crate::frame::{Frame, Rect};
 use crate::matcher::{Match, Matcher, RgbMatcher};
 use crate::template::Template;
@@ -78,17 +79,61 @@ impl Finder {
     /// 当后端报告画面自上次以来**未变化**、且模板与区域都和上次相同,则直接复用
     /// 上次结果、跳过搜索(静态桌面轮询的常见加速;结果与重新搜一遍完全一致)。
     pub fn find_on_screen(&mut self, tpl: &Template) -> Result<Option<Match>> {
+        let _t0 = px_timer!();
         let changed = self.capture.grab_into(&mut self.frame)?;
         let key = self.key_of(tpl);
         if !changed && self.cache_key == Some(key) {
             if let Some(prev) = self.cache_result {
+                px_trace!(
+                    op = "find_on_screen",
+                    backend = self.capture.backend(),
+                    cache_hit = true,
+                    hit = prev.is_some(),
+                    elapsed_us = _t0.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0),
+                );
                 return Ok(prev);
             }
         }
         let m = self.find_in_frame(&self.frame, tpl);
         self.cache_key = Some(key);
         self.cache_result = Some(m);
+        px_trace!(
+            op = "find_on_screen",
+            backend = self.capture.backend(),
+            cache_hit = false,
+            changed,
+            frame = format!("{}x{}", self.frame.width, self.frame.height),
+            tpl_key = format!("{:016x}", key),
+            hit = m.is_some(),
+            elapsed_us = _t0.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0),
+        );
         Ok(m)
+    }
+
+    /// 截一屏并按**颜色范围**找连通色块(不需要模板):`spec.tolerance` 为每
+    /// 通道最大绝对差,`min_area` 过滤碎点;返回按 (y, x) 排序的 [`ColorBlob`]。
+    /// 血条 / 状态灯 / 高亮区这类"只有颜色、没有模板"的场景用它。
+    pub fn find_color_on_screen(
+        &mut self,
+        spec: &ColorSpec,
+        min_area: usize,
+    ) -> Result<Vec<ColorBlob>> {
+        let _t0 = px_timer!();
+        self.capture.grab_into(&mut self.frame)?;
+        let region = self.region.unwrap_or_else(|| self.frame.full_rect());
+        let blobs = color::find_blobs(&self.frame, spec, region, min_area);
+        px_trace!(
+            op = "find_color_on_screen",
+            backend = self.capture.backend(),
+            color = format!("{:?}±{}", spec.rgb, spec.tolerance),
+            region = format!(
+                "({},{},{}x{})",
+                region.x, region.y, region.width, region.height
+            ),
+            blobs = blobs.len(),
+            elapsed_us = _t0.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0),
+        );
+        Ok(blobs)
     }
 
     /// 轮询等待模板**出现**:每 `interval` 查一次,命中立即返回;超过 `timeout`
@@ -103,10 +148,12 @@ impl Finder {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(m) = self.find_on_screen(tpl)? {
+                px_trace!(op = "find_until", result = "hit", timeout = ?timeout);
                 return Ok(Some(m));
             }
             let now = Instant::now();
             if now >= deadline {
+                px_trace!(op = "find_until", result = "timeout", timeout = ?timeout);
                 return Ok(None);
             }
             std::thread::sleep(interval.min(deadline - now));
@@ -124,10 +171,12 @@ impl Finder {
         let deadline = Instant::now() + timeout;
         loop {
             if self.find_on_screen(tpl)?.is_none() {
+                px_trace!(op = "wait_gone", result = "gone", timeout = ?timeout);
                 return Ok(true);
             }
             let now = Instant::now();
             if now >= deadline {
+                px_trace!(op = "wait_gone", result = "still_present", timeout = ?timeout);
                 return Ok(false);
             }
             std::thread::sleep(interval.min(deadline - now));
@@ -287,6 +336,10 @@ mod tests {
             self.grabs += 1;
             Ok(frame(self.present[i]))
         }
+
+        fn backend(&self) -> &'static str {
+            "mock"
+        }
     }
 
     fn target_tpl() -> Template {
@@ -347,5 +400,22 @@ mod tests {
                 Duration::from_millis(5)
             )
             .unwrap());
+    }
+
+    #[test]
+    fn find_color_on_screen_high_level_entry() {
+        let mut f = finder_with(vec![true]);
+        let blobs = f
+            .find_color_on_screen(&ColorSpec::new(255, 0, 0, 10), 32)
+            .unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].bounds, Rect::new(10, 10, 8, 8));
+        assert_eq!(blobs[0].area, 64);
+        // region 限定时,区域外的色块不可见
+        f.set_region(Some(Rect::new(0, 20, 32, 12)));
+        assert!(f
+            .find_color_on_screen(&ColorSpec::new(255, 0, 0, 10), 1)
+            .unwrap()
+            .is_empty());
     }
 }

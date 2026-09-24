@@ -17,6 +17,11 @@ pub trait Capture {
         *dst = self.grab()?;
         Ok(true)
     }
+
+    /// 后端名(用于日志/诊断),默认 `"unknown"`。
+    fn backend(&self) -> &'static str {
+        "unknown"
+    }
 }
 
 /// 基于 `screenshots` 库的跨平台保底后端(输出 RGBA)。
@@ -44,5 +49,9 @@ impl Capture for ScreenshotsCapture {
             .map_err(|e| Error::Capture(e.to_string()))?;
         let (width, height) = (img.width() as usize, img.height() as usize);
         Ok(Frame::rgba8(width, height, img.into_raw()))
+    }
+
+    fn backend(&self) -> &'static str {
+        "screenshots"
     }
 }

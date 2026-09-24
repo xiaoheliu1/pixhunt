@@ -40,10 +40,11 @@ if let Some(m) = finder.find_on_screen(&tpl)? {
 | `capture-window` | `WindowCapture`(PrintWindow 截单个窗口客户区,遮挡也可截) | 仅 Windows |
 | `match-corr` | `CorrMatcher`(corrmatch 的 ZNCC,灰度) | 跨平台 |
 | `parallel` | `RgbMatcher` 按行并行(find / find_all,rayon) | 跨平台 |
+| `tracing` | trace 级诊断事件(截图耗时、缓存跳过、命中与否);关闭零开销 | 跨平台 |
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.3", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
+pixhunt = { version = "0.4", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
 ```
 
 启用后 `CaptureKind` 多出 `Gdi` / `Dxgi` / `Auto`(`Auto` 依次试 DXGI → GDI → screenshots),
@@ -120,6 +121,28 @@ enigo.button(Button::Left, Direction::Click)?;
 ```
 
 完整可运行示例见 `examples/wait_and_click.rs`(Windows,`--features capture-gdi`)。
+
+## 颜色搜索与诊断 (v0.4)
+```rust
+use pixhunt::{ColorSpec, Finder, CaptureKind, MatchKind};
+
+// 6) 颜色范围搜索:没有模板、只有"大概这个颜色"的场景(血条/状态灯/高亮区)。
+//    返回 8-连通色块(包围盒+面积),按 (y,x) 排序,min_area 过滤碎点。
+let red_lights = finder.find_color_on_screen(&ColorSpec::new(255, 0, 0, 40), 50)?;
+for b in red_lights {
+    println!("色块 {:?} 面积 {} 中心 {:?}", b.bounds, b.area, b.center());
+}
+// 也可离线对任意帧用:pixhunt::color::find_blobs(&frame, &spec, region, min_area)
+```
+
+开 `tracing` feature 后,pixhunt 在 `pixhunt` target 下输出 trace 级事件:
+后端名、截图耗时、静态帧缓存是否命中、扫描结果等——"为什么找不到"先看日志:
+
+```rust,ignore
+// 用户侧接一个 subscriber 即可看到
+tracing_subscriber::fmt().with_max_level(tracing::Level::TRACE).init();
+finder.find_on_screen(&tpl)?; // trace: op="find_on_screen" backend="dxgi" changed=false cache_hit=true ...
+```
 
 ## 性能(参考)
 以下数字来自同仓库的 benchmark(1920x1200 / release / 全屏),用来说明**各后端的

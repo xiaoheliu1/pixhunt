@@ -126,4 +126,8 @@ impl Capture for GdiCapture {
         self.inner.grab_into(&mut dst.pixels);
         Ok(true) // GDI 无从判断画面是否变化,保守视为已变
     }
+
+    fn backend(&self) -> &'static str {
+        "gdi"
+    }
 }
