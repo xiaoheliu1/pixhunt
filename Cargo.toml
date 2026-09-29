@@ -2,7 +2,10 @@
 name = "pixhunt"
 version = "0.6.0"
 edition = "2021"
-rust-version = "1.85"
+# resolver 3:生成 Cargo.lock 时按 MSRV 选兼容的依赖版本,而不是无脑拿最新,
+# 否则 rust-version 声明会被上游依赖的新版本悄悄推翻(见 CI 的 msrv job)。
+resolver = "3"
+rust-version = "1.88"
 description = "Fast screen finding: template matching (RGB tolerance / ZNCC), color-blob search and wait/poll APIs, with pluggable capture backends (cross-platform xcap, plus Windows GDI / DXGI / PrintWindow window capture)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xiaoheliu1/pixhunt"

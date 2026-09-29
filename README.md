@@ -216,7 +216,7 @@ v0.6 把默认截图后端从已停维的 `screenshots` 换成 [xcap](https://cr
 | --- | --- |
 | `CaptureKind::Screenshots` | `CaptureKind::Monitor` |
 | `ScreenshotsCapture` | `XCapCapture`(另有 `from_point()` 可绑指定显示器) |
-| MSRV 1.75 | **MSRV 1.85**(xcap 使用 edition 2024) |
+| MSRV 1.75 | **MSRV 1.88**(下限来自 xcap 在 Linux 上的依赖 zbus;开 `match-corr` 需 1.89) |
 | 限定区域 = 抓全屏再裁剪 | `Monitor` 后端**直接区域抓取**(端到端实测 47ms → 20ms) |
 
 命中坐标语义不变:仍是**屏幕绝对坐标**。`Gdi` / `Dxgi` / `Window` 不支持区域直抓,
@@ -239,7 +239,8 @@ cargo run --release --features capture-dxgi,capture-gdi --example find_on_screen
 - **DXGI 限制**:RDP / 锁屏 / 无 GPU 时不可用,`CaptureKind::Auto` 会自动回退。
 - **Linux 系统依赖**:默认后端 xcap 在 X11 走 xcb、Wayland 走 PipeWire/Wayland,
   编译需要:`pkg-config libclang-dev libxcb1-dev libxrandr-dev libdbus-1-dev
-  libpipewire-0.3-dev libwayland-dev libegl-dev`(本仓库 CI 已按此配置)。
+  libpipewire-0.3-dev libwayland-dev libegl-dev libgbm-dev`(本仓库 CI 已按此配置)。
+  缺失时报的是链接错误(如 `unable to find library -lgbm`),不是编译错误。
 - **多显示器**:`Monitor` / `Gdi` / `Dxgi` 都只覆盖**主显示器**。要抓副屏,用
   `XCapCapture::from_point(x, y)`(按屏幕坐标落在哪块屏来选显示器),再交给
   `Finder::new(Box::new(cap), ...)`。
