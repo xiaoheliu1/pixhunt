@@ -23,11 +23,18 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      # screenshots 后端在 Linux 上链接 XCB / D-Bus,runner 镜像未预装 -dev 包
-      # (缺失时报 `rust-lld: error: unable to find library -lxcb`)。
+      # 跨平台保底后端(screenshots / xcap)在 Linux 上要链接 XCB、Xrandr、D-Bus、
+      # PipeWire、Wayland、EGL;runner 镜像未预装这些 -dev 包(缺失时报
+      # `rust-lld: error: unable to find library -lxcb`)。libclang 是给 pipewire-sys
+      # 的 bindgen 用的。
       - name: Install Linux system deps
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxcb1-dev libdbus-1-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libclang-dev \
+            libxcb1-dev libxrandr-dev libdbus-1-dev \
+            libpipewire-0.3-dev libwayland-dev libegl-dev
 
       - name: Format check
         run: cargo fmt --all --check
