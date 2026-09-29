@@ -1,6 +1,6 @@
 [package]
 name = "pixhunt"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Fast, low-dependency screen finding: template matching (RGB tolerance / ZNCC), color-blob search and wait/poll APIs, with pluggable capture backends (GDI / DXGI / PrintWindow window capture)."
@@ -46,7 +46,9 @@ capture-gdi = ["dep:windows"]
 capture-dxgi = ["dep:windows"]
 capture-window = ["dep:windows"]
 match-corr = ["dep:corrmatch"]
-parallel = ["dep:rayon"]
+# weak dep feature:仅在 match-corr 已启用时才把 rayon 传导给 corrmatch,
+# 单独开 parallel 不会硬拉 corrmatch 依赖树。
+parallel = ["dep:rayon", "corrmatch?/rayon"]
 tracing = ["dep:tracing"]
 
 [package.metadata.docs.rs]

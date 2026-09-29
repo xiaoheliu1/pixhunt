@@ -7,14 +7,15 @@
 //!   以及 Windows 上更快的 `GdiCapture` / `DxgiCapture` 与截单个窗口的
 //!   `WindowCapture`(feature 门控)。
 //! - [`Matcher`](matcher::Matcher) —— 怎么找模板:内置极速 [`RgbMatcher`](matcher::RgbMatcher)
-//!   (支持容差),以及基于 corrmatch 的高鲁棒 ZNCC `CorrMatcher`(feature `match-corr`)。
+//!   (支持容差),以及基于 corrmatch 的高鲁棒 ZNCC `CorrMatcher`(feature `match-corr`,
+//!   调参见 `CorrConfig`)。
 //!
 //! 常用能力:整屏查找 [`Finder::find_on_screen`]、限定区域查找
 //! [`Matcher::find_in`]、多结果 [`Matcher::find_all`]、一次截图匹配多模板
 //! [`Finder::find_many_on_screen`]、轮询等待出现/消失 [`Finder::find_until`] /
 //! [`Finder::wait_gone`]、颜色范围搜索 [`Finder::find_color_on_screen`]。
-//! 开 feature `parallel` 可用 rayon 按行并行加速;开 `tracing` 输出 trace 级
-//! 诊断事件(截图耗时、缓存跳过、命中与否),排查"为什么找不到"。
+//! 开 feature `parallel` 可用 rayon 加速(`RgbMatcher` 按行并行、ZNCC 分层并行);
+//! 开 `tracing` 输出 trace 级诊断事件(截图耗时、缓存跳过、命中与否),排查"为什么找不到"。
 //!
 //! ```no_run
 //! use pixhunt::{Finder, CaptureKind, MatchKind, Template};
@@ -28,6 +29,11 @@
 //!     println!("found at ({}, {})", m.x, m.y);
 //! }
 //! ```
+//!
+//! ## 说明
+//! 本 crate 的代码、注释、测试与文档由 **AI 编码助手**生成或改写,并经 `cargo test`
+//! / `cargo clippy -D warnings` / CI 验证;不保证逐行经过人工细读,请按对待任何第三方
+//! 依赖的方式自行评审后用于生产。
 
 /// 内部埋点宏:feature `tracing` 关闭时展开为空(连参数求值都不发生,零开销)。
 #[cfg(feature = "tracing")]
@@ -79,7 +85,7 @@ pub use capture_window::{WindowCapture, WindowHandle};
 #[cfg(feature = "match-corr")]
 mod matcher_corr;
 #[cfg(feature = "match-corr")]
-pub use matcher_corr::CorrMatcher;
+pub use matcher_corr::{CorrConfig, CorrMatcher};
 
 pub use capture::{Capture, ScreenshotsCapture};
 pub use color::{ColorBlob, ColorSpec, FindColor};

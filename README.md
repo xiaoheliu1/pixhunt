@@ -38,13 +38,13 @@ if let Some(m) = finder.find_on_screen(&tpl)? {
 | `capture-gdi` | `GdiCapture`(复用 DC + BitBlt,输出 BGRA) | 仅 Windows |
 | `capture-dxgi` | `DxgiCapture`(桌面复制,GPU 取帧) | 仅 Windows |
 | `capture-window` | `WindowCapture`(PrintWindow 截单个窗口客户区,遮挡也可截) | 仅 Windows |
-| `match-corr` | `CorrMatcher`(corrmatch 的 ZNCC,灰度) | 跨平台 |
-| `parallel` | `RgbMatcher` 按行并行(find / find_all,rayon) | 跨平台 |
+| `match-corr` | `CorrMatcher`(corrmatch 的 ZNCC,灰度;调参见 `CorrConfig`) | 跨平台 |
+| `parallel` | `RgbMatcher` 按行并行(find / find_all,rayon);`CorrMatcher` 分层并行搜索 | 跨平台 |
 | `tracing` | trace 级诊断事件(截图耗时、缓存跳过、命中与否);关闭零开销 | 跨平台 |
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.4", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
+pixhunt = { version = "0.5", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
 ```
 
 启用后 `CaptureKind` 多出 `Gdi` / `Dxgi` / `Auto`(`Auto` 依次试 DXGI → GDI → screenshots),
@@ -67,7 +67,7 @@ let mut finder = Finder::builder()
 | 匹配算法 | 适合 | 特点 |
 | --- | --- | --- |
 | `Rgb` | 屏幕内容与模板几乎一致、追求速度 | 不转灰度、锚点 + 逐像素早失败,通道序自适应(RGBA/BGRA) |
-| `Corr` | 有光照/轻微缩放变化、追求稳 | 灰度 ZNCC + 金字塔,较慢但鲁棒 |
+| `Corr` | 有光照/轻微缩放变化、追求稳 | 灰度 ZNCC + 金字塔,只做平移(不搜旋转),较慢但鲁棒 |
 
 ## 更多用法 (v0.2)
 ```rust
@@ -156,6 +156,55 @@ finder.find_on_screen(&tpl)?; // trace: op="find_on_screen" backend="dxgi" chang
 
 要点:找图瓶颈主要在**截图**,换更快的后端收益最大;`RgbMatcher` 本身已是毫秒级。
 
+`Corr`(ZNCC)不受截图后端制约,成本在搜索本身(1920x1080 全屏 / release / 64px 模板,
+`cargo bench --features match-corr[,parallel] --bench match`):
+
+| 组合 | 热路径(模板已缓存) | 冷启动(含模板编译) |
+| --- | --- | --- |
+| `Corr` | ~15.7ms | ~16.2ms |
+| `Corr` + `parallel`(8 线程) | ~6.2ms | ~6.6ms |
+
+模板只做平移匹配(`compile_unrotated`),不建角度模板库,因此冷启动≈热路径;
+开 `parallel` 后 ZNCC 分层并行,约 2.5x(结果仍确定性)。
+
+## ZNCC 调参 (v0.5)
+`match-corr` 下用 `MatchKind::CorrWith(CorrConfig { .. })` 调搜索参数(只想用默认值
+就继续写 `MatchKind::Corr`):
+
+```rust,ignore
+use pixhunt::{CorrConfig, Finder, CaptureKind, MatchKind, Template};
+
+// 已知目标只在附近小范围移动:砍深层金字塔 + 缩小精修 ROI 换低延迟,
+// 并用 min_score 把"长得像但不够像"的结果当未命中。
+let mut finder = Finder::builder()
+    .capture(CaptureKind::Auto)
+    .matcher(MatchKind::CorrWith(CorrConfig {
+        max_image_levels: 3,
+        roi_radius: 4,
+        min_score: 0.7,
+        ..CorrConfig::default()
+    }))
+    .build()?;
+let m = finder.find_on_screen(&Template::load("btn.png")?)?;
+```
+
+| 字段 | 默认 | 调小的收益 / 调大的收益 |
+| --- | --- | --- |
+| `max_image_levels` | 6 | 粗筛更便宜 / 大位移、轻微缩放更稳 |
+| `beam_width` | 8 | 每层候选更少更快 / 遮挡、伪峰多时更稳 |
+| `roi_radius` | 8 | 精修扫描范围更小更快 / 容忍层间位移误差更大 |
+| `min_score` | 不过滤 | 误命中更少(注意会漏判) |
+| `parallel` | 跟随 `parallel` feature | — |
+
+要点:
+- 非法值(0、NaN、±inf)会被**夹到安全下限**而不是报错,不会出现"配错就永远找不到"。
+- `parallel: true` 只在开了 pixhunt `parallel` feature 时生效——该 feature 会把 `rayon`
+  传导给 corrmatch;否则会被归一为 `false`(否则 corrmatch 会在 `validate()` 直接报错,
+  表现为静默找不到)。
+- `min_score` 是**最终结果**的阈值,在 pixhunt 侧把关,不传给 corrmatch。corrmatch 自己的
+  同名字段是**逐金字塔层**的候选门槛,而粗筛层分数天然偏低,拿它当最终阈值会把真命中
+  整条链路削空。
+
 ## 运行示例
 ```bash
 # 默认(screenshots 后端)
@@ -170,6 +219,12 @@ cargo run --release --features capture-dxgi,capture-gdi --example find_on_screen
 - **DXGI 限制**:RDP / 锁屏 / 无 GPU 时不可用,`CaptureKind::Auto` 会自动回退。
 - 帧字节序:GDI / DXGI 产出 BGRA,screenshots 产出 RGBA;`RgbMatcher` 按帧的
   `PixelFormat` 自动映射通道,无需你手动转换。
+
+## 说明:内容由 AI 生成
+本仓库的**代码、注释、测试与文档(含本 README)由 AI 编码助手生成或改写**,并经
+`cargo test` / `cargo clippy -D warnings` / GitHub Actions 验证。仓库内的性能数字均为
+特定机器上的测量值,只能当量级参考。内容**不保证逐行经过人工细读**,请按对待任何
+第三方 crate 的方式自行评审后再用于生产。
 
 ## 许可
 Licensed under either of **MIT** or **Apache License, Version 2.0** at your option.

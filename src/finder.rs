@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crate::Error;
 
 #[cfg(feature = "match-corr")]
-use crate::matcher_corr::CorrMatcher;
+use crate::matcher_corr::{CorrConfig, CorrMatcher};
 
 /// 可选的截图后端。
 pub enum CaptureKind {
@@ -41,6 +41,9 @@ pub enum MatchKind {
     /// 基于 corrmatch 的 ZNCC(灰度,抗光照/轻微缩放变化)。需 feature `match-corr`。
     #[cfg(feature = "match-corr")]
     Corr,
+    /// 同上,但自定义搜索参数(金字塔层数/ROI/阈值/并行)。需 feature `match-corr`。
+    #[cfg(feature = "match-corr")]
+    CorrWith(CorrConfig),
 }
 
 /// 组装好的找图器。内部**复用一个 [`Frame`]**,逐帧查找不再重复分配像素缓冲。
@@ -277,6 +280,8 @@ impl FinderBuilder {
                 MatchKind::Rgb { tolerance } => Box::new(RgbMatcher::new(tolerance)),
                 #[cfg(feature = "match-corr")]
                 MatchKind::Corr => Box::new(CorrMatcher::new()),
+                #[cfg(feature = "match-corr")]
+                MatchKind::CorrWith(cfg) => Box::new(CorrMatcher::with_config(cfg)),
             };
         let mut f = Finder::new(capture, matcher);
         f.region = self.region;

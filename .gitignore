@@ -1,2 +1,5 @@
 /target
 Cargo.lock
+# 临时诊断产物(如 gh auth status 输出),不入库也不发包
+_gh_status.txt
+*.bak
