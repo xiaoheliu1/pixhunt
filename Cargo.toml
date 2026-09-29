@@ -1,9 +1,9 @@
 [package]
 name = "pixhunt"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-rust-version = "1.75"
-description = "Fast, low-dependency screen finding: template matching (RGB tolerance / ZNCC), color-blob search and wait/poll APIs, with pluggable capture backends (GDI / DXGI / PrintWindow window capture)."
+rust-version = "1.85"
+description = "Fast screen finding: template matching (RGB tolerance / ZNCC), color-blob search and wait/poll APIs, with pluggable capture backends (cross-platform xcap, plus Windows GDI / DXGI / PrintWindow window capture)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xiaoheliu1/pixhunt"
 readme = "README.md"
@@ -14,7 +14,6 @@ categories = ["computer-vision", "multimedia::images", "os"]
 image = { version = "0.25", default-features = false, features = ["png"] }
 # 跨平台保底截图后端(上游 screenshots 已停维,官方指向 xcap)
 xcap = "0.9.8"
-screenshots = "0.8"
 corrmatch = { version = "0.1", features = ["simd"], optional = true }
 rayon = { version = "1", optional = true }
 tracing = { version = "0.1", optional = true }

@@ -1,6 +1,6 @@
 //! 截图"插座":怎么拿到一帧画面。
 
-use crate::frame::Frame;
+use crate::frame::{Frame, Rect};
 use crate::{Error, Result};
 
 /// 可插拔的截图后端。实现 [`Capture::grab`] 即可接入新的抓屏方式(如 GDI / DXGI)。
@@ -18,40 +18,103 @@ pub trait Capture {
         Ok(true)
     }
 
+    /// 只抓取 `rect` 指定的**屏幕绝对坐标**区域,产出局部帧(区域找图时省一次全屏
+    /// 拷贝)。返回 `Ok(None)` 表示该后端不支持直接区域抓取(或区域越界/跨屏),
+    /// 上层应回退为"抓全屏再裁剪"。
+    ///
+    /// 注意:成功时产出的帧原点是 `rect` 左上角,坐标需由上层加回偏移。
+    fn grab_region(&mut self, rect: Rect) -> Result<Option<Frame>> {
+        let _ = rect;
+        Ok(None)
+    }
+
     /// 后端名(用于日志/诊断),默认 `"unknown"`。
     fn backend(&self) -> &'static str {
         "unknown"
     }
 }
 
-/// 基于 `screenshots` 库的跨平台保底后端(输出 RGBA)。
-pub struct ScreenshotsCapture {
-    screen: screenshots::Screen,
+/// 把 `xcap` 的错误映射到统一 [`Error`]。
+fn xcap_err(e: xcap::XCapError) -> Error {
+    Error::Capture(e.to_string())
 }
 
-impl ScreenshotsCapture {
-    /// 使用主显示器。
+/// 基于 [`xcap`](https://crates.io/crates/xcap) 的跨平台保底后端(输出 RGBA)。
+///
+/// 一个实例绑定一个显示器,`Monitor` 对象**可长期复用**(内部只存显示器句柄与几何
+/// 信息),每帧 `grab` 不会重新枚举显示器。
+pub struct XCapCapture {
+    monitor: xcap::Monitor,
+}
+
+impl XCapCapture {
+    /// 主显示器(拿不到主显示器标记时退化为枚举到的第一个)。
     pub fn primary() -> Result<Self> {
-        let screens = screenshots::Screen::all().map_err(|e| Error::Capture(e.to_string()))?;
-        let screen = screens
-            .into_iter()
-            .next()
+        let monitors = xcap::Monitor::all().map_err(xcap_err)?;
+        let monitor = monitors
+            .iter()
+            .find(|m| m.is_primary().unwrap_or(false))
+            .or_else(|| monitors.first())
+            .cloned()
             .ok_or_else(|| Error::Capture("no display found".into()))?;
-        Ok(ScreenshotsCapture { screen })
+        Ok(XCapCapture { monitor })
+    }
+
+    /// 包含给定点(屏幕绝对坐标)的显示器——多屏时用。
+    pub fn from_point(x: i32, y: i32) -> Result<Self> {
+        Ok(XCapCapture {
+            monitor: xcap::Monitor::from_point(x, y).map_err(xcap_err)?,
+        })
+    }
+
+    /// 当前在线显示器个数。
+    pub fn monitor_count() -> Result<usize> {
+        Ok(xcap::Monitor::all().map_err(xcap_err)?.len())
     }
 }
 
-impl Capture for ScreenshotsCapture {
+impl Capture for XCapCapture {
     fn grab(&mut self) -> Result<Frame> {
+        let img = self.monitor.capture_image().map_err(xcap_err)?;
+        Ok(Frame::rgba8(
+            img.width() as usize,
+            img.height() as usize,
+            img.into_raw(),
+        ))
+    }
+
+    fn grab_region(&mut self, rect: Rect) -> Result<Option<Frame>> {
+        // xcap 的区域接口以**显示器左上角**为原点且不接受负值,而 [`Rect`] 用的是屏幕
+        // 绝对坐标(usize)。两者只在"显示器原点恰为 (0,0)"时一致(即主屏),其余情况
+        // (副屏带偏移、跨屏区域)直接回退全屏路径。
+        if self.monitor.x().map_err(xcap_err)? != 0 || self.monitor.y().map_err(xcap_err)? != 0 {
+            return Ok(None);
+        }
+        let (mw, mh) = (
+            self.monitor.width().map_err(xcap_err)? as u64,
+            self.monitor.height().map_err(xcap_err)? as u64,
+        );
+        let (x, y, w, h) = (
+            rect.x as u64,
+            rect.y as u64,
+            rect.width as u64,
+            rect.height as u64,
+        );
+        if w == 0 || h == 0 || x + w > mw || y + h > mh {
+            return Ok(None);
+        }
         let img = self
-            .screen
-            .capture()
-            .map_err(|e| Error::Capture(e.to_string()))?;
-        let (width, height) = (img.width() as usize, img.height() as usize);
-        Ok(Frame::rgba8(width, height, img.into_raw()))
+            .monitor
+            .capture_region(x as u32, y as u32, w as u32, h as u32)
+            .map_err(xcap_err)?;
+        Ok(Some(Frame::rgba8(
+            img.width() as usize,
+            img.height() as usize,
+            img.into_raw(),
+        )))
     }
 
     fn backend(&self) -> &'static str {
-        "screenshots"
+        "xcap"
     }
 }

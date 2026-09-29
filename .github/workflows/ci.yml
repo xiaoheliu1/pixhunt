@@ -23,7 +23,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      # 跨平台保底后端(screenshots / xcap)在 Linux 上要链接 XCB、Xrandr、D-Bus、
+      # 跨平台保底后端(xcap)在 Linux 上要链接 XCB、Xrandr、D-Bus、
       # PipeWire、Wayland、EGL;runner 镜像未预装这些 -dev 包(缺失时报
       # `rust-lld: error: unable to find library -lxcb`)。libclang 是给 pipewire-sys
       # 的 bindgen 用的。
@@ -60,6 +60,12 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --release --features match-corr,parallel
 
+      # tracing 只在 rustdoc 步骤里出现过,单独让它真编译一次(埋点宏展开、字段名
+      # 写错这类问题只有真编译时才暴露)。
+      - name: Test (tracing) [linux]
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --release --features tracing
+
       - name: Clippy (default features)
         run: cargo clippy --release --all-targets -- -D warnings
 
@@ -83,3 +89,22 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --features match-corr,parallel,tracing
+
+  # 声明了 rust-version = "1.85"(下限由 xcap 的 edition 2024 决定),那就真拿 1.85
+  # 编一次:否则 MSRV 声明会悄悄失真。
+  msrv:
+    name: build on MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libclang-dev \
+            libxcb1-dev libxrandr-dev libdbus-1-dev \
+            libpipewire-0.3-dev libwayland-dev libegl-dev
+      - name: Build (default features)
+        run: cargo build --release

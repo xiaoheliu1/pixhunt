@@ -38,7 +38,7 @@ impl From<(usize, usize, usize, usize)> for Rect {
 ///
 /// 约定:每像素 4 字节、行无填充(stride = width * 4);模板则为每像素 3 字节、
 /// 固定 **RGB** 顺序([`crate::Template`])。匹配器依据 [`Frame::rgb_offsets`]
-/// 做通道映射,因此 screenshots(RGBA)与 GDI / DXGI(BGRA)都能零转换直接匹配。
+/// 做通道映射,因此 xcap(RGBA)与 GDI / DXGI(BGRA)都能零转换直接匹配。
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub pixels: Vec<u8>,

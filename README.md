@@ -2,10 +2,9 @@
 
 [![CI](https://github.com/xiaoheliu1/pixhunt/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaoheliu1/pixhunt/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/pixhunt.svg)](https://crates.io/crates/pixhunt)
-[![docs.rs](https://img.shields.io/docsrs/pixhunt)](https://docs.rs/pixhunt)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可)
 
-> 快速、低依赖的**屏幕找图**库:截一帧屏幕,在其中定位一张小图(模板)的坐标。
+> 快速的**屏幕找图**库:截一帧屏幕,在其中定位一张小图(模板)的坐标。
 > 纯 Rust,无需 OpenCV。适合自动化测试、脚本辅助、UI 定位等。
 
 ## 它做什么
@@ -16,7 +15,7 @@ use pixhunt::{Finder, CaptureKind, MatchKind, Template};
 
 let tpl = Template::load("template.png")?;
 let mut finder = Finder::builder()
-    .capture(CaptureKind::Screenshots)         // 截图后端
+    .capture(CaptureKind::Monitor)             // 截图后端
     .matcher(MatchKind::Rgb { tolerance: 25 }) // 找法
     .build()?;
 
@@ -34,7 +33,7 @@ if let Some(m) = finder.find_on_screen(&tpl)? {
 ## 功能开关 (Cargo features)
 | feature | 提供 | 平台 |
 | --- | --- | --- |
-| (默认) | `ScreenshotsCapture` + `RgbMatcher` | 跨平台 |
+| (默认) | `XCapCapture`(基于 xcap)+ `RgbMatcher` | 跨平台 |
 | `capture-gdi` | `GdiCapture`(复用 DC + BitBlt,输出 BGRA) | 仅 Windows |
 | `capture-dxgi` | `DxgiCapture`(桌面复制,GPU 取帧) | 仅 Windows |
 | `capture-window` | `WindowCapture`(PrintWindow 截单个窗口客户区,遮挡也可截) | 仅 Windows |
@@ -44,10 +43,10 @@ if let Some(m) = finder.find_on_screen(&tpl)? {
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.5", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
+pixhunt = { version = "0.6", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
 ```
 
-启用后 `CaptureKind` 多出 `Gdi` / `Dxgi` / `Auto`(`Auto` 依次试 DXGI → GDI → screenshots),
+启用后 `CaptureKind` 多出 `Gdi` / `Dxgi` / `Auto`(`Auto` 依次试 DXGI → GDI → xcap),
 `MatchKind` 多出 `Corr`:
 
 ```rust
@@ -58,11 +57,14 @@ let mut finder = Finder::builder()
 ```
 
 ## 后端与算法怎么选
-| 截图后端 | 特点 | 相对成本 |
+| 截图后端 | 特点 | 成本(1920x1200 实测) |
 | --- | --- | --- |
-| `Screenshots` | 跨平台保底 | 高(每帧重建对象 + 多次全帧拷贝) |
-| `Gdi` | 复用对象 + BitBlt + 免翻转 | 中(约为 screenshots 的一半) |
-| `Dxgi` | 桌面复制,GPU 取帧 | 低(纯读回可到个位数 ms) |
+| `Monitor`(xcap) | 跨平台保底;唯一支持**区域直抓**的后端 | 全屏 ~34ms / 400x300 区域 ~16.5ms |
+| `Gdi` | 复用 DC + BitBlt + 免翻转 | 全屏 ~32ms |
+| `Dxgi` | 桌面复制,GPU 取帧 + 静态帧跳过 | 全屏 ~16ms(无新帧时更低) |
+
+(以上为同一台 1920x1200 桌面、`--release`、连续取帧的中位数;`xcap` / `Gdi` 走 GDI
+路径,量级接近,`xcap` 的价值在于跨平台 + 区域直抓。)
 
 | 匹配算法 | 适合 | 特点 |
 | --- | --- | --- |
@@ -145,27 +147,29 @@ finder.find_on_screen(&tpl)?; // trace: op="find_on_screen" backend="dxgi" chang
 ```
 
 ## 性能(参考)
-以下数字来自同仓库的 benchmark(1920x1200 / release / 全屏),用来说明**各后端的
-相对量级**,并非所有后端都已内置于当前发布版本:
+同一台 8 逻辑核机器、`--release` 实测。截图为 1920x1200 真实桌面的连续取帧中位数,
+纯匹配为 `cargo bench --bench match`(1920x1080 合成帧 + 64px 模板):
 
 | 组合 | 纯匹配 | 截图 | 端到端(截图+匹配) |
 | --- | --- | --- | --- |
-| RGB + screenshots | ~5ms | ~54ms | ~57ms |
-| RGB + GDI | ~5ms | ~29ms | ~34ms |
-| RGB + DXGI | ~5ms | ~7ms | ~12ms |
+| RGB + `Monitor`(xcap) | 串行 ~3.0ms / `parallel` ~1.7ms | ~34ms | ~36ms |
+| RGB + `Gdi` | 同上 | ~32ms | ~34ms |
+| RGB + `Dxgi` | 同上 | ~16ms(静态桌面更低) | ~18ms |
 
 要点:找图瓶颈主要在**截图**,换更快的后端收益最大;`RgbMatcher` 本身已是毫秒级。
+限定区域 + `Monitor` 会走**区域直抓**(400x300 实测截图 ~16.5ms,与"截全屏再裁剪"
+逐字节一致),同一模板端到端从 ~47ms 降到 ~20ms。
 
-`Corr`(ZNCC)不受截图后端制约,成本在搜索本身(1920x1080 全屏 / release / 64px 模板,
-`cargo bench --features match-corr[,parallel] --bench match`):
+`Corr`(ZNCC)不受截图后端制约,成本在搜索本身(同样 `cargo bench --features
+match-corr[,parallel] --bench match`):
 
 | 组合 | 热路径(模板已缓存) | 冷启动(含模板编译) |
 | --- | --- | --- |
-| `Corr` | ~15.7ms | ~16.2ms |
-| `Corr` + `parallel`(8 线程) | ~6.2ms | ~6.6ms |
+| `Corr` | ~13.7ms | ~13.7ms |
+| `Corr` + `parallel`(8 逻辑核) | ~6.6ms | ~6.8ms |
 
 模板只做平移匹配(`compile_unrotated`),不建角度模板库,因此冷启动≈热路径;
-开 `parallel` 后 ZNCC 分层并行,约 2.5x(结果仍确定性)。
+开 `parallel` 后 ZNCC 分层并行,约 2x(结果仍确定性)。
 
 ## ZNCC 调参 (v0.5)
 `match-corr` 下用 `MatchKind::CorrWith(CorrConfig { .. })` 调搜索参数(只想用默认值
@@ -205,9 +209,22 @@ let m = finder.find_on_screen(&Template::load("btn.png")?)?;
   同名字段是**逐金字塔层**的候选门槛,而粗筛层分数天然偏低,拿它当最终阈值会把真命中
   整条链路削空。
 
+## 升级到 v0.6 (breaking)
+v0.6 把默认截图后端从已停维的 `screenshots` 换成 [xcap](https://crates.io/crates/xcap):
+
+| v0.5 | v0.6 |
+| --- | --- |
+| `CaptureKind::Screenshots` | `CaptureKind::Monitor` |
+| `ScreenshotsCapture` | `XCapCapture`(另有 `from_point()` 可绑指定显示器) |
+| MSRV 1.75 | **MSRV 1.85**(xcap 使用 edition 2024) |
+| 限定区域 = 抓全屏再裁剪 | `Monitor` 后端**直接区域抓取**(端到端实测 47ms → 20ms) |
+
+命中坐标语义不变:仍是**屏幕绝对坐标**。`Gdi` / `Dxgi` / `Window` 不支持区域直抓,
+限定区域时自动回退为"抓全屏再裁剪",结果一致。
+
 ## 运行示例
 ```bash
-# 默认(screenshots 后端)
+# 默认(xcap / Monitor 后端)
 cargo run --release --example find_on_screen -- path/to/template.png
 # 用 Windows 快后端 + 自动选择
 cargo run --release --features capture-dxgi,capture-gdi --example find_on_screen -- path/to/template.png
@@ -215,10 +232,23 @@ cargo run --release --features capture-dxgi,capture-gdi --example find_on_screen
 
 ## 注意
 - **分辨率 / DPI**:模板与截图需同一分辨率尺度,否则找不到。
+- **文档**:`cargo doc --no-deps --open` 看完整 API 注释。docs.rs 上本 crate 可能构建
+  失败 —— 因为依赖 xcap 的构建脚本需要系统库(libclang / PipeWire headers),
+  docs.rs 环境没有这些包,不是本 crate 的代码问题。
 - **截图 ≠ 匹配**:两者是分开计时/分开的步骤,别把截图耗时算进算法。
 - **DXGI 限制**:RDP / 锁屏 / 无 GPU 时不可用,`CaptureKind::Auto` 会自动回退。
-- 帧字节序:GDI / DXGI 产出 BGRA,screenshots 产出 RGBA;`RgbMatcher` 按帧的
+- **Linux 系统依赖**:默认后端 xcap 在 X11 走 xcb、Wayland 走 PipeWire/Wayland,
+  编译需要:`pkg-config libclang-dev libxcb1-dev libxrandr-dev libdbus-1-dev
+  libpipewire-0.3-dev libwayland-dev libegl-dev`(本仓库 CI 已按此配置)。
+- **多显示器**:`Monitor` / `Gdi` / `Dxgi` 都只覆盖**主显示器**。要抓副屏,用
+  `XCapCapture::from_point(x, y)`(按屏幕坐标落在哪块屏来选显示器),再交给
+  `Finder::new(Box::new(cap), ...)`。
+- 帧字节序:GDI / DXGI 产出 BGRA,xcap / PrintWindow 产出 RGBA;`RgbMatcher` 按帧的
   `PixelFormat` 自动映射通道,无需你手动转换。
+- **平坦内容会让 `Rgb` 退化**:当模板与搜索区域**都**近乎单色(相邻像素几乎没有差异)
+  时,锚点与逐像素早失败全部失效,扫描退化为暴力全量。1080p + 64px 实测:有纹理
+  ~3ms,零方差模板放在纯色背景上 ~1.9s(慢 600 倍),且平坦区里会有多个"等价"命中点。
+  裁模板请选**有边缘、有纹理**的区域,别从纯色背景上切一块。
 
 ## 说明:内容由 AI 生成
 本仓库的**代码、注释、测试与文档(含本 README)由 AI 编码助手生成或改写**,并经

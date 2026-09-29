@@ -1,5 +1,5 @@
 //! Windows GDI 截图后端:复用 DC/位图 + BitBlt(1:1) + 负 biHeight 免翻转,
-//! 输出 **BGRA**。相比 `screenshots` 库消除了每帧重建对象的开销;`grab_into`
+//! 输出 **BGRA**。相比跨平台保底后端(`XCapCapture`)消除了每帧重建对象的开销;`grab_into`
 //! 更把像素直接 `GetDIBits` 写进调用方缓冲,连内部中转 buffer 都省了。
 
 use crate::capture::Capture;

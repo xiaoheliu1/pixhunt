@@ -1,9 +1,9 @@
 //! # pixhunt
 //!
-//! 快速、低依赖的**屏幕找图**库:截一帧屏幕,在其中定位一张小图(模板)的坐标。
+//! 快速的**屏幕找图**库:截一帧屏幕,在其中定位一张小图(模板)的坐标。
 //!
 //! 两个"可插拔插座":
-//! - [`Capture`] —— 怎么拿到画面:跨平台的 `ScreenshotsCapture`,
+//! - [`Capture`] —— 怎么拿到画面:跨平台的 `XCapCapture`(基于 xcap),
 //!   以及 Windows 上更快的 `GdiCapture` / `DxgiCapture` 与截单个窗口的
 //!   `WindowCapture`(feature 门控)。
 //! - [`Matcher`] —— 怎么找模板:内置极速 [`RgbMatcher`]
@@ -21,7 +21,7 @@
 //! use pixhunt::{Finder, CaptureKind, MatchKind, Template};
 //! let tpl = Template::load("template.png").unwrap();
 //! let mut finder = Finder::builder()
-//!     .capture(CaptureKind::Screenshots)
+//!     .capture(CaptureKind::Monitor)
 //!     .matcher(MatchKind::Rgb { tolerance: 25 })
 //!     .build()
 //!     .unwrap();
@@ -87,7 +87,7 @@ mod matcher_corr;
 #[cfg(feature = "match-corr")]
 pub use matcher_corr::{CorrConfig, CorrMatcher};
 
-pub use capture::{Capture, ScreenshotsCapture};
+pub use capture::{Capture, XCapCapture};
 pub use color::{ColorBlob, ColorSpec, FindColor};
 pub use error::{Error, Result};
 pub use finder::{CaptureKind, Finder, MatchKind};

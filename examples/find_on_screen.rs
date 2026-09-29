@@ -13,7 +13,7 @@ fn main() -> pixhunt::Result<()> {
     println!("模板尺寸: {}x{}", tpl.width, tpl.height);
 
     let mut finder = Finder::builder()
-        .capture(CaptureKind::Screenshots)
+        .capture(CaptureKind::Monitor)
         .matcher(MatchKind::Rgb { tolerance: 25 })
         .build()?;
 

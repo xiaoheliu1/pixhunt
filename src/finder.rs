@@ -1,6 +1,6 @@
 //! 高层封装:把"截图"和"匹配"拼成一步到位的 [`Finder`]。
 
-use crate::capture::{Capture, ScreenshotsCapture};
+use crate::capture::{Capture, XCapCapture};
 use crate::color::{self, ColorBlob, ColorSpec};
 use crate::frame::{Frame, Rect};
 use crate::matcher::{Match, Matcher, RgbMatcher};
@@ -17,8 +17,8 @@ use crate::matcher_corr::{CorrConfig, CorrMatcher};
 
 /// 可选的截图后端。
 pub enum CaptureKind {
-    /// 跨平台保底(基于 `screenshots` 库,输出 RGBA)。
-    Screenshots,
+    /// 跨平台保底(基于 `xcap` 库,输出 RGBA;只绑主显示器)。
+    Monitor,
     /// 复用型 GDI BitBlt(仅 Windows,输出 BGRA)。需 feature `capture-gdi`。
     #[cfg(all(windows, feature = "capture-gdi"))]
     Gdi,
@@ -29,7 +29,7 @@ pub enum CaptureKind {
     /// 需 feature `capture-window`。
     #[cfg(all(windows, feature = "capture-window"))]
     Window(crate::capture_window::WindowHandle),
-    /// 自动选最快可用:DXGI → GDI → screenshots。需至少一个 Windows 后端 feature。
+    /// 自动选最快可用:DXGI → GDI → xcap。需至少一个 Windows 后端 feature。
     #[cfg(all(windows, any(feature = "capture-gdi", feature = "capture-dxgi")))]
     Auto,
 }
@@ -83,7 +83,7 @@ impl Finder {
     /// 上次结果、跳过搜索(静态桌面轮询的常见加速;结果与重新搜一遍完全一致)。
     pub fn find_on_screen(&mut self, tpl: &Template) -> Result<Option<Match>> {
         let _t0 = px_timer!();
-        let changed = self.capture.grab_into(&mut self.frame)?;
+        let (changed, origin) = self.grab_scoped()?;
         let key = self.key_of(tpl);
         if !changed && self.cache_key == Some(key) {
             if let Some(prev) = self.cache_result {
@@ -97,7 +97,7 @@ impl Finder {
                 return Ok(prev);
             }
         }
-        let m = self.find_in_frame(&self.frame, tpl);
+        let m = self.search(tpl, origin);
         self.cache_key = Some(key);
         self.cache_result = Some(m);
         px_trace!(
@@ -122,9 +122,16 @@ impl Finder {
         min_area: usize,
     ) -> Result<Vec<ColorBlob>> {
         let _t0 = px_timer!();
-        self.capture.grab_into(&mut self.frame)?;
-        let region = self.region.unwrap_or_else(|| self.frame.full_rect());
-        let blobs = color::find_blobs(&self.frame, spec, region, min_area);
+        let (_, origin) = self.grab_scoped()?;
+        let region = self.search_rect(origin);
+        let mut blobs = color::find_blobs(&self.frame, spec, region, min_area);
+        if origin != (0, 0) {
+            // 区域帧里的坐标是相对区域左上角的,换回屏幕绝对坐标
+            for b in &mut blobs {
+                b.bounds.x += origin.0 as usize;
+                b.bounds.y += origin.1 as usize;
+            }
+        }
         px_trace!(
             op = "find_color_on_screen",
             backend = self.capture.backend(),
@@ -188,19 +195,22 @@ impl Finder {
 
     /// 截一屏并找全部不重叠匹配(至多 `max` 个,`max=0` 不限)。
     pub fn find_all_on_screen(&mut self, tpl: &Template, max: usize) -> Result<Vec<Match>> {
-        let changed = self.capture.grab_into(&mut self.frame)?;
-        let _ = changed;
-        let region = self.region.unwrap_or_else(|| self.frame.full_rect());
-        Ok(self.matcher.find_all(&self.frame, tpl, region, max))
+        let (_, origin) = self.grab_scoped()?;
+        let region = self.search_rect(origin);
+        let mut ms = self.matcher.find_all(&self.frame, tpl, region, max);
+        if origin != (0, 0) {
+            for m in &mut ms {
+                m.x += origin.0;
+                m.y += origin.1;
+            }
+        }
+        Ok(ms)
     }
 
     /// 只截一屏,依次匹配多个模板(省掉重复截图)。
     pub fn find_many_on_screen(&mut self, tpls: &[&Template]) -> Result<Vec<Option<Match>>> {
-        self.capture.grab_into(&mut self.frame)?;
-        Ok(tpls
-            .iter()
-            .map(|t| self.find_in_frame(&self.frame, t))
-            .collect())
+        let (_, origin) = self.grab_scoped()?;
+        Ok(tpls.iter().map(|t| self.search(t, origin)).collect())
     }
 
     /// 在给定帧里查找模板(不涉及截图,便于测试/离线;遵循已设 region)。
@@ -214,6 +224,52 @@ impl Finder {
     /// 当前限定区域(若有)。
     pub fn region(&self) -> Option<Rect> {
         self.region
+    }
+
+    /// 抓一帧供本次查找使用,返回(画面相对上次是否变化, 该帧左上角的屏幕坐标)。
+    ///
+    /// 设了 region 且后端支持直接区域抓取([`Capture::grab_region`] 返回
+    /// `Some`)时只截该区域——省掉一次整屏拷贝与后续裁剪。此时帧内坐标是**区域
+    /// 相对**的,第二个返回值就是需要加回的偏移;不支持则为 `(changed, (0, 0))`,
+    /// 行为与旧版"截全屏再按 region 裁剪"完全一致。
+    fn grab_scoped(&mut self) -> Result<(bool, (i32, i32))> {
+        if let Some(r) = self.region {
+            if let Some(f) = self.capture.grab_region(r)? {
+                self.frame = f;
+                return Ok((true, (r.x as i32, r.y as i32)));
+            }
+        }
+        Ok((self.capture.grab_into(&mut self.frame)?, (0, 0)))
+    }
+
+    /// 本次搜索应在帧内哪个矩形上进行。
+    fn search_rect(&self, origin: (i32, i32)) -> Rect {
+        if origin == (0, 0) {
+            self.region.unwrap_or_else(|| self.frame.full_rect())
+        } else {
+            // 帧本身就是 region,整帧搜索即等价于旧的"全屏 + region 裁剪"
+            self.frame.full_rect()
+        }
+    }
+
+    /// 在 [`grab_scoped`](Self::grab_scoped) 产出的帧上查模板,结果换算为屏幕绝对坐标。
+    ///
+    /// 能走 [`Matcher::find`] 就走:`find_in` 的**默认实现**是"裁剪子帧 + 拷贝",
+    /// 没覆写它的匹配器(如 `CorrMatcher`)在整屏帧上会白拷一帧(1080p 约 8MB)。
+    /// 只有"全屏帧 + 限定区域"才真的需要 `find_in` 收窄范围。
+    fn search(&self, tpl: &Template, origin: (i32, i32)) -> Option<Match> {
+        let mut m = if origin != (0, 0) {
+            // 帧本身就是 region,整帧搜即等价于旧的"全屏 + region 裁剪"
+            self.matcher.find(&self.frame, tpl)?
+        } else {
+            match self.region {
+                Some(r) => self.matcher.find_in(&self.frame, tpl, r)?,
+                None => self.matcher.find(&self.frame, tpl)?,
+            }
+        };
+        m.x += origin.0;
+        m.y += origin.1;
+        Some(m)
     }
 
     /// 设置/清除限定区域(`None`=整屏)。会作废内部结果缓存。
@@ -261,8 +317,8 @@ impl FinderBuilder {
         self
     }
     pub fn build(self) -> Result<Finder> {
-        let capture: Box<dyn Capture> = match self.capture.unwrap_or(CaptureKind::Screenshots) {
-            CaptureKind::Screenshots => Box::new(ScreenshotsCapture::primary()?),
+        let capture: Box<dyn Capture> = match self.capture.unwrap_or(CaptureKind::Monitor) {
+            CaptureKind::Monitor => Box::new(XCapCapture::primary()?),
             #[cfg(all(windows, feature = "capture-gdi"))]
             CaptureKind::Gdi => Box::new(crate::capture_gdi::GdiCapture::new_primary()),
             #[cfg(all(windows, feature = "capture-dxgi"))]
@@ -289,7 +345,7 @@ impl FinderBuilder {
     }
 }
 
-/// 依次尝试 DXGI → GDI → screenshots,返回第一个可用的。
+/// 依次尝试 DXGI → GDI → xcap,返回第一个可用的。
 #[cfg(all(windows, any(feature = "capture-gdi", feature = "capture-dxgi")))]
 fn auto_capture() -> Result<Box<dyn Capture>> {
     #[cfg(feature = "capture-dxgi")]
@@ -301,12 +357,15 @@ fn auto_capture() -> Result<Box<dyn Capture>> {
         return Ok(Box::new(crate::capture_gdi::GdiCapture::new_primary()));
     }
     #[allow(unreachable_code)]
-    Ok(Box::new(ScreenshotsCapture::primary()?))
+    Ok(Box::new(XCapCapture::primary()?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     const W: usize = 32;
     const H: usize = 32;
@@ -422,5 +481,180 @@ mod tests {
             .find_color_on_screen(&ColorSpec::new(255, 0, 0, 10), 1)
             .unwrap()
             .is_empty());
+    }
+
+    /// 区域帧:24x24,一块 8x8 纯红贴在帧内 (4,5)。
+    fn region_frame() -> Frame {
+        let (w, h) = (24usize, 24usize);
+        let mut px = vec![0u8; w * h * 4];
+        for y in 5..13 {
+            for x in 4..12 {
+                let i = (y * w + x) * 4;
+                px[i] = 255;
+                px[i + 3] = 255;
+            }
+        }
+        Frame::rgba8(w, h, px)
+    }
+
+    /// 支持区域截取的后端:全屏帧里故意没有目标,只有区域帧里有。
+    struct RegionCap {
+        region_grabs: Rc<Cell<usize>>,
+        full_grabs: Rc<Cell<usize>>,
+    }
+
+    impl Capture for RegionCap {
+        fn grab(&mut self) -> Result<Frame> {
+            self.full_grabs.set(self.full_grabs.get() + 1);
+            Ok(frame(false))
+        }
+
+        fn grab_region(&mut self, r: Rect) -> Result<Option<Frame>> {
+            assert_eq!(
+                (r.x, r.y, r.width, r.height),
+                (20, 16, 24, 24),
+                "应收到屏幕绝对坐标区域"
+            );
+            self.region_grabs.set(self.region_grabs.get() + 1);
+            Ok(Some(region_frame()))
+        }
+
+        fn backend(&self) -> &'static str {
+            "mock-region"
+        }
+    }
+
+    fn region_finder() -> (Finder, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        let (rg, fg) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let mut f = Finder::new(
+            Box::new(RegionCap {
+                region_grabs: rg.clone(),
+                full_grabs: fg.clone(),
+            }),
+            Box::new(RgbMatcher::new(0)),
+        );
+        f.set_region(Some(Rect::new(20, 16, 24, 24)));
+        (f, rg, fg)
+    }
+
+    /// region + 支持区域截取的后端:只截区域,且结果换算回屏幕绝对坐标。
+    #[test]
+    fn region_prefers_backend_region_grab() {
+        let (mut f, rg, fg) = region_finder();
+        let m = f
+            .find_on_screen(&target_tpl())
+            .unwrap()
+            .expect("区域内应命中");
+        // 帧内 (4,5) + 区域原点 (20,16)
+        assert_eq!((m.x, m.y), (24, 21), "应返回屏幕绝对坐标");
+        assert_eq!(rg.get(), 1);
+        assert_eq!(fg.get(), 0, "能只截区域时不应再截全屏");
+    }
+
+    /// find_all / find_color 两条入口在区域截图下也必须给出绝对坐标。
+    #[test]
+    fn region_grab_shifts_all_and_color_results() {
+        let (mut f, rg, _) = region_finder();
+
+        let all = f.find_all_on_screen(&target_tpl(), 0).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].x, all[0].y), (24, 21));
+
+        let blobs = f
+            .find_color_on_screen(&ColorSpec::new(255, 0, 0, 10), 32)
+            .unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].bounds, Rect::new(24, 21, 8, 8));
+        assert_eq!(blobs[0].area, 64);
+        assert_eq!(rg.get(), 2, "两次入口都应走区域路径");
+    }
+
+    /// 只记录走了哪个入口的匹配器(没覆写 `find_in` 的匹配器走它会整帧拷贝)。
+    struct SpyMatcher {
+        finds: Rc<Cell<usize>>,
+        find_ins: Rc<Cell<usize>>,
+    }
+
+    impl Matcher for SpyMatcher {
+        fn find(&self, _frame: &Frame, _tpl: &Template) -> Option<Match> {
+            self.finds.set(self.finds.get() + 1);
+            Some(Match {
+                x: 1,
+                y: 2,
+                score: 1.0,
+            })
+        }
+
+        fn find_in(&self, _frame: &Frame, _tpl: &Template, _region: Rect) -> Option<Match> {
+            self.find_ins.set(self.find_ins.get() + 1);
+            Some(Match {
+                x: 1,
+                y: 2,
+                score: 1.0,
+            })
+        }
+    }
+
+    fn spy() -> (SpyMatcher, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        let (f, i) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        (
+            SpyMatcher {
+                finds: f.clone(),
+                find_ins: i.clone(),
+            },
+            f,
+            i,
+        )
+    }
+
+    /// 未设 region 时必须走 `find`:走 `find_in` 会让没覆写它的匹配器(如
+    /// `CorrMatcher`)白拷一整帧。
+    #[test]
+    fn no_region_uses_find_not_find_in() {
+        let (m, finds, find_ins) = spy();
+        let mut f = Finder::new(
+            Box::new(SeqCapture {
+                present: vec![true],
+                grabs: 0,
+            }),
+            Box::new(m),
+        );
+        assert!(f.find_on_screen(&target_tpl()).unwrap().is_some());
+        assert_eq!((finds.get(), find_ins.get()), (1, 0));
+    }
+
+    /// 全屏帧 + 限定区域(后端不支持区域直抓):必须用 `find_in` 收窄范围。
+    #[test]
+    fn region_without_backend_support_uses_find_in() {
+        let (m, finds, find_ins) = spy();
+        let mut f = Finder::new(
+            Box::new(SeqCapture {
+                present: vec![true],
+                grabs: 0,
+            }),
+            Box::new(m),
+        );
+        f.set_region(Some(Rect::new(2, 3, 8, 8)));
+        assert!(f.find_on_screen(&target_tpl()).unwrap().is_some());
+        assert_eq!((finds.get(), find_ins.get()), (0, 1));
+    }
+
+    /// 区域直抓时帧本身就是 region,再走 `find_in(整帧)` 就是多余的一次拷贝;
+    /// 同时坐标仍要换算回屏幕绝对位置。
+    #[test]
+    fn region_grab_searches_whole_frame_with_find() {
+        let (m, finds, find_ins) = spy();
+        let mut f = Finder::new(
+            Box::new(RegionCap {
+                region_grabs: Rc::new(Cell::new(0)),
+                full_grabs: Rc::new(Cell::new(0)),
+            }),
+            Box::new(m),
+        );
+        f.set_region(Some(Rect::new(20, 16, 24, 24)));
+        let hit = f.find_on_screen(&target_tpl()).unwrap().unwrap();
+        // 帧内 (1,2) + 区域原点 (20,16)
+        assert_eq!((hit.x, hit.y), (21, 18));
+        assert_eq!((finds.get(), find_ins.get()), (1, 0));
     }
 }
