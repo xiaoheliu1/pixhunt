@@ -3,7 +3,7 @@
 use crate::frame::{Frame, Rect};
 use crate::template::Template;
 
-/// 一次匹配结果:模板左上角落在 `(x, y)`,`score` ∈ [0,1] 越大越像。
+/// 一次匹配结果:模板左上角落在 `(x, y)`,`score` 取值 `0.0..=1.0`,越大越像。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Match {
     pub x: i32,

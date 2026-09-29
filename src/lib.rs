@@ -3,10 +3,10 @@
 //! 快速、低依赖的**屏幕找图**库:截一帧屏幕,在其中定位一张小图(模板)的坐标。
 //!
 //! 两个"可插拔插座":
-//! - [`Capture`](capture::Capture) —— 怎么拿到画面:跨平台的 `ScreenshotsCapture`,
+//! - [`Capture`] —— 怎么拿到画面:跨平台的 `ScreenshotsCapture`,
 //!   以及 Windows 上更快的 `GdiCapture` / `DxgiCapture` 与截单个窗口的
 //!   `WindowCapture`(feature 门控)。
-//! - [`Matcher`](matcher::Matcher) —— 怎么找模板:内置极速 [`RgbMatcher`](matcher::RgbMatcher)
+//! - [`Matcher`] —— 怎么找模板:内置极速 [`RgbMatcher`]
 //!   (支持容差),以及基于 corrmatch 的高鲁棒 ZNCC `CorrMatcher`(feature `match-corr`,
 //!   调参见 `CorrConfig`)。
 //!
