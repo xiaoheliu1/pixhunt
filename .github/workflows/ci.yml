@@ -4,6 +4,10 @@ on:
   push:
     branches: [master]
   pull_request:
+  # 库 crate 不提交 Cargo.lock(惯例),于是每跑一次 CI 都是**重新解析**依赖:上游一发新版,
+  # 解析结果就可能落到从没编过的组合上。而不改代码就不会触发 push/PR——定时跑一次当下限预警。
+  schedule:
+    - cron: "17 3 * * 1" # 每周一 03:17 UTC(错开整点,排队快些)
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,6 +16,8 @@ jobs:
   test:
     name: build & test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # 定时任务只做 MSRV 预警,不必再烧整套矩阵的 runner 时间。
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -93,7 +99,7 @@ jobs:
 
   # 声明了 rust-version = "1.88"(下限由 xcap 的 Linux 依赖 zbus 5 决定),那就真拿
   # 1.88 编一次:否则 MSRV 声明会悄悄失真。只测默认 feature——开 `match-corr` 后
-  # corrmatch 的依赖(wide/safe_arch)目前要 1.89。
+  # corrmatch 的依赖(wide/safe_arch)目前要 1.89。也是 schedule 唯一跑的任务。
   msrv:
     name: build on MSRV (1.88)
     runs-on: ubuntu-latest

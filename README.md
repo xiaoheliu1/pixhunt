@@ -43,7 +43,7 @@ if let Some(m) = finder.find_on_screen(&tpl)? {
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.6", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
+pixhunt = { version = "0.7", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
 ```
 
 启用后 `CaptureKind` 多出 `Gdi` / `Dxgi` / `Auto`(`Auto` 依次试 DXGI → GDI → xcap),
@@ -208,6 +208,19 @@ let m = finder.find_on_screen(&Template::load("btn.png")?)?;
 - `min_score` 是**最终结果**的阈值,在 pixhunt 侧把关,不传给 corrmatch。corrmatch 自己的
   同名字段是**逐金字塔层**的候选门槛,而粗筛层分数天然偏低,拿它当最终阈值会把真命中
   整条链路削空。
+
+## 升级到 v0.7 (breaking)
+`Error::Capture` 改成命名字段变体,让截图失败能保住**错误链**:
+
+| v0.6 | v0.7 |
+| --- | --- |
+| `Error::Capture(String)`(`source()` 恒为 `None`) | `Error::Capture { message, source }` |
+| 手写 `Error::Capture(msg.into())` | `Error::capture(msg)`;要带底层错误用 `Error::capture_from(ctx, e)` |
+
+`message` 是"在哪一步失败"(如 `xcap Monitor::capture_image()`),`source` 是原始错误
+(xcap 内部还会再包一层 io / D-Bus / Win32 错误,不保留就取不到了)。`Display` 仍把两者
+拼成一行,所以只做 `e.to_string()` / `?` 上抛的代码**输出不变**,只有 `match` 到
+`Error::Capture(s)` 的地方需要改成 `Error::Capture { message, .. }`。
 
 ## 升级到 v0.6 (breaking)
 v0.6 把默认截图后端从已停维的 `screenshots` 换成 [xcap](https://crates.io/crates/xcap):

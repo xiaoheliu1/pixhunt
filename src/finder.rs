@@ -324,7 +324,7 @@ impl FinderBuilder {
             #[cfg(all(windows, feature = "capture-dxgi"))]
             CaptureKind::Dxgi => Box::new(
                 crate::capture_dxgi::DxgiCapture::new_primary()
-                    .ok_or_else(|| Error::Capture("DXGI desktop duplication unavailable".into()))?,
+                    .ok_or_else(|| Error::capture("DXGI desktop duplication unavailable"))?,
             ),
             #[cfg(all(windows, feature = "capture-window"))]
             CaptureKind::Window(h) => Box::new(crate::capture_window::WindowCapture::new(h)),

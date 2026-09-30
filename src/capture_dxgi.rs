@@ -169,7 +169,7 @@ impl Capture for DxgiCapture {
         let mut frame = Frame::bgra8(0, 0, Vec::new());
         self.inner.grab_into(&mut frame);
         if frame.pixels.is_empty() {
-            return Err(Error::Capture("dxgi returned empty frame".into()));
+            return Err(Error::capture("dxgi returned empty frame"));
         }
         Ok(frame)
     }
@@ -177,7 +177,7 @@ impl Capture for DxgiCapture {
     fn grab_into(&mut self, dst: &mut Frame) -> Result<bool> {
         let changed = self.inner.grab_into(dst);
         if dst.pixels.is_empty() {
-            return Err(Error::Capture("dxgi returned empty frame".into()));
+            return Err(Error::capture("dxgi returned empty frame"));
         }
         Ok(changed)
     }

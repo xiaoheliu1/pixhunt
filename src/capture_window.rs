@@ -80,8 +80,8 @@ impl PrintCap {
     fn grab_into(&mut self, dst: &mut Vec<u8>) -> Result<()> {
         self.resize_if_needed();
         if self.w == 0 || self.h == 0 {
-            return Err(Error::Capture(
-                "window has an empty client area (minimized?)".into(),
+            return Err(Error::capture(
+                "window has an empty client area (minimized?)",
             ));
         }
         unsafe {
@@ -92,7 +92,7 @@ impl PrintCap {
                 PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT),
             );
             if !ok.as_bool() {
-                return Err(Error::Capture("PrintWindow failed".into()));
+                return Err(Error::capture("PrintWindow failed"));
             }
             let ret = GetDIBits(
                 self.hdc_mem,
@@ -104,7 +104,7 @@ impl PrintCap {
                 DIB_RGB_COLORS,
             );
             if ret == 0 {
-                return Err(Error::Capture("GetDIBits failed".into()));
+                return Err(Error::capture("GetDIBits failed"));
             }
         }
         Ok(())
@@ -172,7 +172,7 @@ impl WindowCapture {
         unsafe {
             let hw = FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr()));
             if hw.0 == 0 {
-                return Err(Error::Capture(format!(
+                return Err(Error::capture(format!(
                     "no top-level window with title {title:?}"
                 )));
             }
@@ -191,8 +191,8 @@ impl Capture for WindowCapture {
         self.inner.resize_if_needed();
         let (w, h) = (self.inner.w, self.inner.h);
         if w == 0 || h == 0 {
-            return Err(Error::Capture(
-                "window has an empty client area (minimized?)".into(),
+            return Err(Error::capture(
+                "window has an empty client area (minimized?)",
             ));
         }
         let mut pixels = vec![0u8; w * h * 4];
@@ -204,8 +204,8 @@ impl Capture for WindowCapture {
         self.inner.resize_if_needed();
         let (w, h) = (self.inner.w, self.inner.h);
         if w == 0 || h == 0 {
-            return Err(Error::Capture(
-                "window has an empty client area (minimized?)".into(),
+            return Err(Error::capture(
+                "window has an empty client area (minimized?)",
             ));
         }
         dst.prepare_bgra(w, h);
