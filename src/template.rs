@@ -42,7 +42,7 @@ impl Template {
     /// 转成单通道灰度(Rec.601 加权),供 ZNCC 等匹配器使用。
     pub fn to_gray(&self) -> Vec<u8> {
         let mut gray = Vec::with_capacity(self.width * self.height);
-        for px in self.rgb.chunks_exact(3) {
+        for px in self.rgb.as_chunks::<3>().0 {
             let r = px[0] as u32;
             let g = px[1] as u32;
             let b = px[2] as u32;

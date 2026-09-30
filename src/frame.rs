@@ -147,7 +147,7 @@ impl Frame {
         let (ro, go, bo) = self.rgb_offsets();
         out.clear();
         out.reserve(self.width * self.height);
-        for px in self.pixels.chunks_exact(4) {
+        for px in self.pixels.as_chunks::<4>().0 {
             let r = px[ro] as u32;
             let g = px[go] as u32;
             let bl = px[bo] as u32;

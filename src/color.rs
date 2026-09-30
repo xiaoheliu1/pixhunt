@@ -235,7 +235,7 @@ mod tests {
     /// 黑底 RGBA 帧 + 给定 RGB 块列表 (x, y, w, h, color)。
     fn scene(blocks: &[(usize, usize, usize, usize, [u8; 3])]) -> Frame {
         let mut px = vec![0u8; W * H * 4];
-        for p in px.chunks_exact_mut(4) {
+        for p in px.as_chunks_mut::<4>().0 {
             p[3] = 255;
         }
         for &(x, y, w, h, col) in blocks {
@@ -297,7 +297,7 @@ mod tests {
         // 同内容构造 BGRA 帧,结果应与 RGBA 帧一致(通道自适应)。
         let rgba = scene(&[(10, 10, 20, 8, RED)]);
         let mut bgra_px = rgba.pixels.clone();
-        for p in bgra_px.chunks_exact_mut(4) {
+        for p in bgra_px.as_chunks_mut::<4>().0 {
             p.swap(0, 2);
         }
         let bgra = Frame::bgra8(W, H, bgra_px);
