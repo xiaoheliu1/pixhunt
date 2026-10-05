@@ -29,6 +29,10 @@ pub enum CaptureKind {
     /// 需 feature `capture-window`。
     #[cfg(all(windows, feature = "capture-window"))]
     Window(crate::capture_window::WindowHandle),
+    /// 按窗口标题(**精确匹配**)截单个窗口客户区(仅 Windows,坐标为窗口相对)。
+    /// 需 feature `capture-window`。
+    #[cfg(all(windows, feature = "capture-window"))]
+    WindowByTitle(String),
     /// 自动选最快可用:DXGI → GDI → xcap。需至少一个 Windows 后端 feature。
     #[cfg(all(windows, any(feature = "capture-gdi", feature = "capture-dxgi")))]
     Auto,
@@ -52,6 +56,7 @@ pub struct Finder {
     matcher: Box<dyn Matcher>,
     region: Option<Rect>,
     frame: Frame,
+    prev_frame: Option<Frame>,
     cache_key: Option<u64>,
     cache_result: Option<Option<Match>>,
 }
@@ -72,6 +77,7 @@ impl Finder {
             matcher,
             region: None,
             frame: Frame::bgra8(0, 0, Vec::new()),
+            prev_frame: None,
             cache_key: None,
             cache_result: None,
         }
@@ -221,6 +227,55 @@ impl Finder {
         }
     }
 
+    /// 截一屏找模板,返回**模板中心**的屏幕坐标(省去手动加半尺寸)。
+    ///
+    /// 命中时 `Match.x`/`Match.y` = 左上角 + 宽高的一半(整数除法)。
+    /// 适合"找到后直接点击中心"的场景。
+    pub fn find_center_on_screen(&mut self, tpl: &Template) -> Result<Option<Match>> {
+        let m = self.find_on_screen(tpl)?;
+        Ok(m.map(|m| Match {
+            x: m.x + tpl.width as i32 / 2,
+            y: m.y + tpl.height as i32 / 2,
+            score: m.score,
+        }))
+    }
+
+    /// 截一屏,与上一次截图的帧在指定区域内逐像素对比,
+    /// 返回**颜色有差异的像素数**。首次调用(无参考帧)返回区域内全部像素数。
+    ///
+    /// 用途:"这块区域变了吗?""动画是否还在跑?""有没有新消息图标闪了一下"。
+    /// 比较时使用 R/G/B 三通道(忽略 Alpha),任一通道差值 !=0 即计为不同。
+    pub fn diff_since_last(&mut self, rect: Rect) -> Result<u32> {
+        let _ = self.grab_scoped()?;
+        let r = self.frame.clamp(rect);
+        let count = match &self.prev_frame {
+            None => (r.width * r.height) as u32,
+            Some(prev) => {
+                let (ro, go, bo) = self.frame.rgb_offsets();
+                let (pro, pgo, pbo) = prev.rgb_offsets();
+                let sw4 = self.frame.width * 4;
+                let pw4 = prev.width * 4;
+                let mut diff = 0u32;
+                for y in r.y..r.y + r.height {
+                    for x in r.x..r.x + r.width {
+                        let ci = y * sw4 + x * 4;
+                        let pi = y * pw4 + x * 4;
+                        if self.frame.pixels[ci + ro] != prev.pixels[pi + pro]
+                            || self.frame.pixels[ci + go] != prev.pixels[pi + pgo]
+                            || self.frame.pixels[ci + bo] != prev.pixels[pi + pbo]
+                        {
+                            diff += 1;
+                        }
+                    }
+                }
+                diff
+            }
+        };
+        // 当前帧变为下次比较的基线
+        self.prev_frame = Some(self.frame.clone());
+        Ok(count)
+    }
+
     /// 当前限定区域(若有)。
     pub fn region(&self) -> Option<Rect> {
         self.region
@@ -328,6 +383,10 @@ impl FinderBuilder {
             ),
             #[cfg(all(windows, feature = "capture-window"))]
             CaptureKind::Window(h) => Box::new(crate::capture_window::WindowCapture::new(h)),
+            #[cfg(all(windows, feature = "capture-window"))]
+            CaptureKind::WindowByTitle(ref title) => {
+                Box::new(crate::capture_window::WindowCapture::from_title(title)?)
+            }
             #[cfg(all(windows, any(feature = "capture-gdi", feature = "capture-dxgi")))]
             CaptureKind::Auto => auto_capture()?,
         };
@@ -656,5 +715,42 @@ mod tests {
         // 帧内 (1,2) + 区域原点 (20,16)
         assert_eq!((hit.x, hit.y), (21, 18));
         assert_eq!((finds.get(), find_ins.get()), (1, 0));
+    }
+
+    #[test]
+    fn find_center_returns_center_coords() {
+        // 目标 8x8 贴在 (10,10),中心 = (14, 14)
+        let mut f = finder_with(vec![true]);
+        let m = f
+            .find_center_on_screen(&target_tpl())
+            .unwrap()
+            .expect("应命中");
+        assert_eq!((m.x, m.y), (10 + 8 / 2, 10 + 8 / 2));
+    }
+
+    #[test]
+    fn diff_since_last_first_call_returns_area() {
+        // 首次无基线,应返回全部像素数
+        let mut f = finder_with(vec![true]);
+        let d = f.diff_since_last(Rect::new(0, 0, 10, 10)).unwrap();
+        assert_eq!(d, 100);
+    }
+
+    #[test]
+    fn diff_since_last_same_frame_returns_zero() {
+        // 同一帧连续两次 diff:无变化应为 0
+        let mut f = finder_with(vec![true]);
+        let _ = f.diff_since_last(Rect::new(0, 0, 32, 32)).unwrap();
+        let d = f.diff_since_last(Rect::new(0, 0, 32, 32)).unwrap();
+        assert_eq!(d, 0);
+    }
+
+    #[test]
+    fn diff_since_last_detects_change() {
+        // 第一帧无目标(全黑),第二帧有目标(红色块)→ diff > 0
+        let mut f = finder_with(vec![false, true]);
+        let _ = f.diff_since_last(Rect::new(0, 0, 32, 32)).unwrap();
+        let d = f.diff_since_last(Rect::new(0, 0, 32, 32)).unwrap();
+        assert!(d > 0, "两帧不同应检出变化,got {}", d);
     }
 }

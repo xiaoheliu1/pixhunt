@@ -188,6 +188,7 @@ struct Scan<'a> {
     tw3: usize,
     thr: i32,
     samples: Vec<Sample>,
+    mask: Option<&'a [bool]>,
     y_lo: usize,
     y_hi: usize,
     x_lo: usize,
@@ -205,8 +206,10 @@ impl<'a> Scan<'a> {
             return None;
         }
         let tw3 = tw * 3;
+        let mask = tpl.mask.as_deref();
         // 采样点:中心 + 四角(内缩以避开边缘抗锯齿),都是模板真实像素 ->
         // "全部通过"是"整窗匹配"的必要条件,故预筛不会漏掉真匹配。
+        // 有掩码时只选"未被掩掉"的锚点。
         let inset_x = 2.min(tw / 2);
         let inset_y = 2.min(th / 2);
         let cx = tw / 2;
@@ -220,6 +223,12 @@ impl<'a> Scan<'a> {
         ];
         let mut samples: Vec<Sample> = Vec::with_capacity(pts.len());
         for (sx, sy) in pts {
+            // 跳过被掩码标记为不参与比较的锚点
+            if let Some(m) = mask {
+                if !m[sy * tw + sx] {
+                    continue;
+                }
+            }
             let i = sy * tw3 + sx * 3;
             let s = Sample {
                 sx,
@@ -242,6 +251,7 @@ impl<'a> Scan<'a> {
             tw3,
             thr,
             samples,
+            mask,
             x_lo: r.x,
             x_hi: r.x + (r.width - tw) + 1,
             y_lo: r.y,
@@ -292,7 +302,15 @@ impl<'a> Scan<'a> {
             let trow = &self.tpl[ti..ti + self.tw3];
             let mut si = 0usize;
             let mut tj = 0usize;
-            for _ in 0..self.tw {
+            for tx in 0..self.tw {
+                // 掩码跳过
+                if let Some(m) = self.mask {
+                    if !m[ty * self.tw + tx] {
+                        si += 4;
+                        tj += 3;
+                        continue;
+                    }
+                }
                 if (srow[si + ro] as i32 - trow[tj] as i32).abs() > self.thr
                     || (srow[si + go] as i32 - trow[tj + 1] as i32).abs() > self.thr
                     || (srow[si + bo] as i32 - trow[tj + 2] as i32).abs() > self.thr
@@ -495,5 +513,48 @@ mod tests {
             RgbMatcher::new(5).find(&frame, &t).is_none(),
             "偏差 20 超出容差 5,不应命中"
         );
+    }
+
+    /// 掩码跳过后,被掩像素即使完全不同也应命中。
+    #[test]
+    fn mask_skips_transparent_pixels() {
+        let (w, h) = (32usize, 32usize);
+        let mut px = vec![0u8; w * h * 4];
+        // 贴一块 8x8 区域:前 4 像素(一行)红,后 4 像素蓝
+        for x in 0..8 {
+            let y = 10;
+            let i = (y * w + 10 + x) * 4;
+            if x < 4 {
+                px[i] = 255; // R
+            } else {
+                px[i + 2] = 255; // B
+            }
+            px[i + 3] = 255;
+        }
+        // 模板全部声明为红,但后 4 像素被掩码跳过
+        let mut tpl_rgb = Vec::with_capacity(8 * 3);
+        for _ in 0..8 {
+            tpl_rgb.extend_from_slice(&[255, 0, 0]);
+        }
+        let mask: Vec<bool> = (0..8).map(|i| i < 4).collect(); // 后 4 跳过
+        let t = Template::from_rgb(tpl_rgb, 8, 1).with_mask(mask);
+        let frame = Frame::rgba8(w, h, px);
+        let m = RgbMatcher::new(0)
+            .find(&frame, &t)
+            .expect("掩码后应命中(被掩像素不比较)");
+        assert_eq!((m.x, m.y), (10, 10));
+    }
+
+    /// 掩码全部为 false(等效于"什么都不用比较")——锚点列表为空,verify 不检查任何像素,
+    /// 当前实现下第一个候选位置即通过(因为所有条件都"跳过")。这不算 bug,
+    /// 但说明"全掩模板"语义上等价于"匹配任意位置",用户应确保至少有可见像素。
+    #[test]
+    fn mask_all_false_matches_first_position() {
+        let (w, h) = (16usize, 16usize);
+        let frame = Frame::rgba8(w, h, vec![0u8; w * h * 4]);
+        let t = Template::from_rgb(vec![99u8; 4 * 4 * 3], 4, 4).with_mask(vec![false; 4 * 4]);
+        let m = RgbMatcher::new(0).find(&frame, &t);
+        // 全掩时没有锚点可筛,verify 全跳过 → 第一个位置就通过
+        assert!(m.is_some(), "全掩模板应给出命中(语义:不需要比较任何像素)");
     }
 }

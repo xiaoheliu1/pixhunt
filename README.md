@@ -43,14 +43,14 @@ if let Some(m) = finder.find_on_screen(&tpl)? {
 | (默认) | `XCapCapture`(基于 xcap)+ `RgbMatcher` | 跨平台 |
 | `capture-gdi` | `GdiCapture`(复用 DC + BitBlt,输出 BGRA) | 仅 Windows |
 | `capture-dxgi` | `DxgiCapture`(桌面复制,GPU 取帧) | 仅 Windows |
-| `capture-window` | `WindowCapture`(PrintWindow 截单个窗口客户区,遮挡也可截) | 仅 Windows |
+| `capture-window` | `WindowCapture`(PrintWindow 截单个窗口客户区,遮挡也可截)+ `CaptureKind::WindowByTitle` | 仅 Windows |
 | `match-corr` | `CorrMatcher`(corrmatch 的 ZNCC,灰度;调参见 `CorrConfig`) | 跨平台 |
 | `parallel` | `RgbMatcher` 按行并行(find / find_all,rayon);`CorrMatcher` 分层并行搜索 | 跨平台 |
 | `tracing` | trace 级诊断事件(截图耗时、缓存跳过、命中与否);关闭零开销 | 跨平台 |
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.7", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
+pixhunt = { version = "0.8", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
 ```
 
 启用后 `CaptureKind` 多出 `Gdi` / `Dxgi` / `Auto`(`Auto` 依次试 DXGI → GDI → xcap),
@@ -215,6 +215,14 @@ let m = finder.find_on_screen(&Template::load("btn.png")?)?;
 - `min_score` 是**最终结果**的阈值,在 pixhunt 侧把关,不传给 corrmatch。corrmatch 自己的
   同名字段是**逐金字塔层**的候选门槛,而粗筛层分数天然偏低,拿它当最终阈值会把真命中
   整条链路削空。
+
+## v0.8 新功能
+
+- **透明掩码模板**:`Template::load` 自动识别 PNG alpha;新增 `Template::from_rgba` / `with_mask`;`RgbMatcher` 比较时跳过掩码像素。
+- **`find_center_on_screen`**:返回模板**中心**坐标,省去手动加半尺寸。
+- **`diff_since_last(rect)`**:对比上一次截图,返回指定区域内颜色有变的像素数。
+- **`CaptureKind::WindowByTitle(..)`**:`FinderBuilder` 直接按窗口标题精确匹配截窗口,无需先拿句柄。
+- **图片格式扩展**:`Template::load` 现支持 **PNG + JPEG + WebP**(之前仅 PNG)。
 
 ## 升级到 v0.7 (breaking)
 `Error::Capture` 改成命名字段变体,让截图失败能保住**错误链**:

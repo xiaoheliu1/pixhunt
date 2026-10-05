@@ -1,6 +1,6 @@
 # pixhunt 使用说明书(从零开始)
 
-> 适用版本:**pixhunt 0.7.0**(2026-09-30 发布)。
+> 适用版本:**pixhunt 0.8.0**(2026-10-05 发布)。
 > 读者假设:**你几乎没写过 Rust**,但你想在自己的屏幕上"找一张图在哪里",然后做点事。
 > 这份说明书覆盖**全部对外 API**、每个参数的含义、能直接复制运行的示例、以及报错怎么排查。
 
@@ -120,14 +120,14 @@ myhunter/
 
 ```toml
 [dependencies]
-pixhunt = "0.7"
+pixhunt = "0.8"
 ```
 
 想用 Windows 上更快的截图后端或更强的算法,就开对应"功能开关"(第 6 章详解):
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.7", features = ["capture-dxgi", "capture-gdi", "capture-window", "match-corr", "parallel"] }
+pixhunt = { version = "0.8", features = ["capture-dxgi", "capture-gdi", "capture-window", "match-corr", "parallel"] }
 ```
 
 改完保存。**不需要手动下载**,第一次运行 `cargo run` 时 Cargo 会自动联网抓依赖。
@@ -379,7 +379,7 @@ Rust 的 `feature` 就是**编译时的可选开关**。库里写了很多代码
 | (不开任何) | `XCapCapture`、`CaptureKind::Monitor`、`RgbMatcher`、颜色搜索 | 全平台 |
 | `capture-gdi` | `GdiCapture`、`CaptureKind::Gdi`、`CaptureKind::Auto` | 仅 Windows |
 | `capture-dxgi` | `DxgiCapture`、`CaptureKind::Dxgi`、`CaptureKind::Auto` | 仅 Windows |
-| `capture-window` | `WindowCapture`、`WindowHandle`、`CaptureKind::Window(..)` | 仅 Windows |
+| `capture-window` | `WindowCapture`、`WindowHandle`、`CaptureKind::Window(..)`、`CaptureKind::WindowByTitle(..)` | 仅 Windows |
 | `match-corr` | `CorrMatcher`、`CorrConfig`、`MatchKind::Corr` / `CorrWith(..)` | 全平台(需 Rust **1.89**) |
 | `parallel` | `RgbMatcher` 按行并行、ZNCC 分层并行(结果完全一致) | 全平台 |
 | `tracing` | 库内部输出 trace 级诊断(截图耗时、缓存跳过、命中与否) | 全平台 |
@@ -396,7 +396,7 @@ Rust 的 `feature` 就是**编译时的可选开关**。库里写了很多代码
 ```toml
 # 永久:写进 Cargo.toml
 [dependencies]
-pixhunt = { version = "0.7", features = ["capture-dxgi", "match-corr", "parallel"] }
+pixhunt = { version = "0.8", features = ["capture-dxgi", "match-corr", "parallel"] }
 ```
 
 ```powershell
@@ -467,6 +467,8 @@ sudo apt-get install -y --no-install-recommends \
 | 等它消失 | `finder.wait_gone(&tpl, timeout, interval)?` | `Result<bool>` |
 | 按颜色找色块 | `finder.find_color_on_screen(&spec, min_area)?` | `Result<Vec<ColorBlob>>` |
 | 不截图,在已有帧里找 | `finder.find_in_frame(&frame, &tpl)` | `Option<Match>` |
+| 找到后直接拿中心坐标(免手动加半尺寸) | `finder.find_center_on_screen(&tpl)?` | `Result<Option<Match>>` |
+| 判断"这块区域变了没" | `finder.diff_since_last(rect)?` | `Result<u32>` |
 | 改限定区域 | `finder.set_region(Some(Rect::new(..)))` / `set_region(None)` | `()` |
 | 读区域 | `finder.region()` | `Option<Rect>` |
 | 单独截一帧 | `capture.grab()?` / `capture.grab_into(&mut dst)?` | `Result<Frame>` / `Result<bool>` |
@@ -629,6 +631,35 @@ finder.set_region(None);                                   // 恢复全屏
 let cur = finder.region();                                 // 读回来
 ```
 
+#### 8.1.11 `find_center_on_screen(&mut self, tpl: &Template) -> Result<Option<Match>>`
+
+与 `find_on_screen` 相同,但返回的 `x`/`y` 是模板**中心**而非左上角(省去手动加半尺寸)。
+
+```rust
+if let Some(m) = finder.find_center_on_screen(&tpl)? {
+    // m.x, m.y 就是可以直接点击的中心坐标
+    println!("点击 ({}, {})", m.x, m.y);
+}
+```
+
+#### 8.1.12 `diff_since_last(&mut self, rect: Rect) -> Result<u32>`
+
+截一屏后与**上一次截图**对比,返回 `rect` 内颜色有差异的像素数量。
+
+- 首次调用(无基线)返回 `rect.width * rect.height`(视为"全部变了")。
+- 比较 R/G/B 三通道(忽略 Alpha),任一通道不等就算"不同"。
+- 调用后当前帧成为下一次比较的基线。
+- 用途:判断"这块区域动画停了没""有没有新消息红点亮起"。
+
+```rust
+let changed = finder.diff_since_last(Rect::new(100, 100, 200, 50))?;
+if changed == 0 {
+    println!("画面静止");
+} else {
+    println!("有 {} 个像素变了", changed);
+}
+```
+
 ### 8.2 装配:`FinderBuilder`、`CaptureKind`、`MatchKind`
 
 #### 8.2.1 `FinderBuilder` 的四个方法
@@ -658,6 +689,7 @@ pub enum CaptureKind {
     Gdi,                              // 〔f:capture-gdi〕   Windows,输出 BGRA
     Dxgi,                             // 〔f:capture-dxgi〕  Windows,最快,输出 BGRA
     Window(WindowHandle),             // 〔f:capture-window〕截指定窗口,坐标为窗口相对
+    WindowByTitle(String),            // 〔f:capture-window〕按标题精确匹配截窗口
     Auto,                             // 〔f:capture-gdi 或 capture-dxgi〕依次试 DXGI → GDI → xcap
 }
 ```
@@ -671,6 +703,7 @@ pub enum CaptureKind {
 | `Gdi` | `"gdi"` | ~32ms | DXGI 不可用时的 Windows 保底 |
 | `Auto` | 取决于选中谁 | 16~34ms | 懒得想就它;RDP/锁屏会自动退级 |
 | `Window(h)` | `"print-window"` | 取决于窗口大小 | 只盯某个窗口、或它被挡住了 |
+| `WindowByTitle("...")` | `"print-window"` | 取决于窗口大小 | 同上,但免手动拿句柄(标题精确匹配) |
 
 两个要命的限制:
 
@@ -778,32 +811,47 @@ let (r, g, b) = (frame.pixels[i + ro], frame.pixels[i + go], frame.pixels[i + bo
 
 ```rust
 pub struct Template {
-    pub rgb: Vec<u8>,   // 每像素 3 字节,固定 RGB
+    pub rgb: Vec<u8>,            // 每像素 3 字节,固定 RGB
     pub width: usize,
     pub height: usize,
+    pub mask: Option<Vec<bool>>, // 掩码:true=参与比较,false=跳过
 }
 ```
 
+`mask` 为 `None` 时全部像素参与比较(向后兼容)。从含 alpha 通道的 PNG 加载时,
+`alpha == 0` 的像素会被自动标记为 `false`(不参与比较)。
+
 #### 8.4.2 `Template::load(path: impl AsRef<Path>) -> Result<Self>`
 
-从图片文件读模板,内部转成 RGB(透明通道被丢掉)。
+从图片文件读模板,内部转成 RGB(透明通道被丢掉或变成掩码)。
 
 - 参数可以是 `"a.png"`、`String`、`PathBuf`、`Path`——都自动适配。
-- **当前只解码 PNG**。存成 JPG/BMP 会返回 `Err(Error::Image(..))`(见 11.4)。
-- 透明像素不会变成"忽略该区域"的掩码:它被展平成一个具体颜色值。想用"带透明背景的模板",
-  请先把背景 P 成屏幕上实际会显示的样子。
+- **支持 PNG、JPEG、WebP**(v0.8 起)。通过文件头自动识别格式,不需要扩展名正确。
+- PNG 若含 alpha 通道且存在 `alpha == 0` 的像素,那些位置会被设为掩码跳过位
+  (`RgbMatcher` 比较时忽略),不需要你手动处理。
+- 其他格式(BMP/GIF/TIFF)仍返回 `Err(Error::Image(..))`(见 11.4)。
+- 透明像素不会变成"忽略该区域"的掩码:非 alpha=0 的透明像素(alpha=1~254)
+  仍参与比较,只是 RGB 值按实际存储使用。
 
 ```rust
 let tpl = Template::load("D:/pic/button.png")?;
 let tpl2 = Template::load(std::path::PathBuf::from("button.png"))?;
 ```
 
-#### 8.4.3 `Template::from_rgb(rgb: Vec<u8>, width: usize, height: usize) -> Template`
+#### 8.4.3 `Template::from_rgb` / `from_rgba` / `with_mask`
 
-从内存里的 RGB 字节造模板(自己渲染的、或从别处拿到的像素)。
+```rust
+pub fn from_rgb(rgb: Vec<u8>, width: usize, height: usize) -> Self
+pub fn from_rgba(rgba: Vec<u8>, width: usize, height: usize) -> Self
+pub fn with_mask(self, mask: Vec<bool>) -> Self   // builder-style
+```
 
-⚠️ 内部有 `assert_eq!(rgb.len(), width * height * 3)`,长度不对**直接 panic**(不是返回错误)。
-从别处搬来的字节先确认长度。
+- `from_rgb`:从内存里的 RGB 字节造模板(无掩码,全部像素参与比较)。
+- `from_rgba`:从 RGBA 字节造模板,`alpha == 0` 的像素自动变成掩码跳过位。
+- `with_mask`:在已有模板上手动指定掩码(链式调用);`mask.len() == width * height`。
+
+⚠️ `from_rgb` 内部有 `assert_eq!(rgb.len(), width * height * 3)`,长度不对**直接 panic**。
+`from_rgba` 同理(`width * height * 4`)。从别处搬来的字节先确认长度。
 
 #### 8.4.4 `Template::content_key(&self) -> u64` 与 `to_gray(&self) -> Vec<u8>`
 
@@ -1230,7 +1278,7 @@ pixhunt **不管鼠标**,点击交给生态库 [`enigo`](https://crates.io/crate
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.7", features = ["capture-dxgi"] }
+pixhunt = { version = "0.8", features = ["capture-dxgi"] }
 enigo = "0.6"
 ```
 
@@ -1393,7 +1441,7 @@ if let Some(b) = blobs.first() {
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.7", features = ["tracing"] }
+pixhunt = { version = "0.8", features = ["tracing"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 ```
@@ -1573,7 +1621,7 @@ cargo build --all-features
 能过就说明是 feature。把需要的写进 `Cargo.toml`:
 
 ```toml
-pixhunt = { version = "0.7", features = ["capture-dxgi", "match-corr"] }
+pixhunt = { version = "0.8", features = ["capture-dxgi", "match-corr"] }
 ```
 
 另一种典型:`error: expected 2 arguments` / 找不到 `Window` 变体 —— `CaptureKind::Window(..)`
@@ -1596,12 +1644,12 @@ sudo apt-get install -y --no-install-recommends \
 `-lgbm` 对应 `libgbm-dev`,`-lxcb` 对应 `libxcb1-dev`,依此类推。
 `bindgen` 相关的报错则查 `libclang-dev`。
 
-### 11.4 `capture/image error` 或读不了 JPG、BMP
+### 11.4 读不了 JPG / BMP / GIF...
 
-`error: image error: ...` 而你的图确实是 `.jpg` / `.bmp`:
-**当前版本的 `image` 依赖只启用了 PNG 解码**。
+v0.8 起 `Template::load` 已支持 **PNG、JPEG、WebP** 三种格式(通过文件头自动识别)。
+如果你用的是 BMP/GIF/TIFF 等其他格式,目前仍不被解码,会返回 `Err(Error::Image(..))`。
 
-解决办法:先把模板转成 PNG(画图、PowerToys 或任何截图工具都能存 PNG)。
+解决办法:把模板转成上述三种格式之一(PowerToys 或任何截图工具都能存 PNG/JPG)。
 
 ```powershell
 # 用 .NET 随手转一下(PowerShell)
@@ -1685,9 +1733,9 @@ cargo doc --no-deps --open
 
 ```
 Finder, CaptureKind, MatchKind                 —— finder.rs
-Finder(方法):builder, new, find_on_screen, find_all_on_screen, find_many_on_screen,
-              find_color_on_screen, find_in_frame, find_until, wait_gone,
-              set_region, region
+Finder(方法):builder, new, find_on_screen, find_center_on_screen, find_all_on_screen,
+              find_many_on_screen, find_color_on_screen, find_in_frame, find_until,
+              wait_gone, diff_since_last, set_region, region
 FinderBuilder(方法,经 Finder::builder() 得到):capture, matcher, region, build
 
 Frame, Rect, PixelFormat                        —— frame.rs
@@ -1697,7 +1745,7 @@ Rect:x/y/width/height(usize);Rect::new;(usize,usize,usize,usize) → Rect
 PixelFormat:Rgba8, Bgra8
 
 Template                                        —— template.rs
-Template:字段 rgb/width/height;load, from_rgb, content_key, to_gray
+Template:字段 rgb/width/height/mask;load, from_rgb, from_rgba, with_mask, content_key, to_gray
 
 Match, Matcher, RgbMatcher                      —— matcher.rs
 Match:字段 x(i32)/y(i32)/score(f32)
@@ -1730,6 +1778,7 @@ Result<T> = std::result::Result<T, Error>
                   WindowCapture::size() -> (usize, usize)
                   impl Capture(backend "print-window")
                   CaptureKind::Window(WindowHandle)
+                  CaptureKind::WindowByTitle(String)
 〔gdi 或 dxgi〕   CaptureKind::Auto
 〔match-corr〕    CorrMatcher::new() / with_config(CorrConfig) / Default
                   CorrConfig{max_image_levels, beam_width, roi_radius, min_score, parallel}
@@ -1814,11 +1863,12 @@ pixhunt::template   Template
 | --- | --- | --- |
 | v0.5 | v0.6 | 默认后端从 `screenshots` 换成 `xcap`:`CaptureKind::Screenshots` → `Monitor`;`ScreenshotsCapture` → `XCapCapture`;MSRV 1.75 → **1.88**(开 `match-corr` 需 1.89);限定区域改为优先"直接区域抓取" |
 | v0.6 | v0.7 | `Error::Capture(String)` → `Error::Capture { message, source }`;新增 `Error::capture` / `Error::capture_from`;只做 `to_string()` 的代码输出不变 |
+| v0.7 | v0.8 | `Template` 新增 `pub mask: Option<Vec<bool>>` 字段——用字面量构造 `Template { rgb, width, height }` 的代码需加 `mask: None`;推荐走工厂方法(`load`/`from_rgb`/`from_rgba`)则无需改动。新增 `find_center_on_screen`、`diff_since_last`、`CaptureKind::WindowByTitle`;`Template::load` 现支持 JPEG/WebP |
 
 ## 许可
 
 MIT OR Apache-2.0。
 
-> 本说明书内容由 AI 编码助手依据 **pixhunt 0.7.0 的实际源码**逐个 API 清点后撰写,
+> 本说明书内容由 AI 编码助手依据 **pixhunt 0.8.0 的实际源码**逐个 API 清点后撰写,
 > 不保证逐行经过人工细读。若你升级了版本,请以 `cargo doc --no-deps --open` 生成的
 > 最新文档和源码为准。

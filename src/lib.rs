@@ -10,10 +10,12 @@
 //!   (支持容差),以及基于 corrmatch 的高鲁棒 ZNCC `CorrMatcher`(feature `match-corr`,
 //!   调参见 `CorrConfig`)。
 //!
-//! 常用能力:整屏查找 [`Finder::find_on_screen`]、限定区域查找
-//! [`Matcher::find_in`]、多结果 [`Matcher::find_all`]、一次截图匹配多模板
+//! 常用能力:整屏查找 [`Finder::find_on_screen`]、中心坐标 [`Finder::find_center_on_screen`]、
+//! 限定区域查找 [`Matcher::find_in`]、多结果 [`Matcher::find_all`]、一次截图匹配多模板
 //! [`Finder::find_many_on_screen`]、轮询等待出现/消失 [`Finder::find_until`] /
-//! [`Finder::wait_gone`]、颜色范围搜索 [`Finder::find_color_on_screen`]。
+//! [`Finder::wait_gone`]、颜色范围搜索 [`Finder::find_color_on_screen`]、
+//! 变化检测 [`Finder::diff_since_last`]。
+//! 模板支持透明掩码 `Template::mask`(跳过指定像素不比较)。
 //! 开 feature `parallel` 可用 rayon 加速(`RgbMatcher` 按行并行、ZNCC 分层并行);
 //! 开 `tracing` 输出 trace 级诊断事件(截图耗时、缓存跳过、命中与否),排查"为什么找不到"。
 //!
