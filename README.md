@@ -23,6 +23,8 @@ let mut finder = Finder::builder()
 if let Some(m) = finder.find_on_screen(&tpl)? {
     // 注意:`Rgb` 是"容差内逐像素全对才算命中"的判定,它的 m.score 恒为 1.0;
     // 想要真正的相似度分数(0.0..=1.0)请用 MatchKind::Corr。
+    // 另:`Some` 只说明"至少有一处"。命中不止一处时它给的是最上、最左的那个,
+    // 不告诉你还有第二个 —— 要判唯一用 finder.find_all_on_screen(&tpl, 2)。
     let (cx, cy) = m.center(&tpl); // 要点击的是中心,不是左上角
     println!("命中 @ ({}, {}),中心 ({}, {})", m.x, m.y, cx, cy);
 }
@@ -49,7 +51,7 @@ if let Some(m) = finder.find_on_screen(&tpl)? {
 | `capture-dxgi` | `DxgiCapture`(桌面复制,GPU 取帧) | 仅 Windows |
 | `capture-window` | `WindowCapture`(PrintWindow 截单个窗口客户区,遮挡也可截)+ `CaptureKind::WindowByTitle` | 仅 Windows |
 | `match-corr` | `CorrMatcher`(corrmatch 的 ZNCC,灰度;调参见 `CorrConfig`) | 跨平台 |
-| `parallel` | `RgbMatcher` 按行并行(find / find_all,rayon);`CorrMatcher` 分层并行搜索 | 跨平台 |
+| `parallel` | `RgbMatcher` 按行并行(find / find_all,rayon);`CorrMatcher` 分层搜索。**例外**:平坦画面的 `find_all` 里并行帮不上忙,库里会自己退回串行流式(见 v0.8.2 变更) | 跨平台 |
 | `tracing` | trace 级诊断事件(截图耗时、缓存跳过、命中与否);关闭零开销 | 跨平台 |
 
 ```toml
@@ -110,6 +112,8 @@ let hits = finder.find_many_on_screen(&[&tpl_a, &tpl_b, &tpl_c])?;
 [`Matcher::find`] 整帧单个、[`Matcher::find_in`] 区域内单个、
 [`Matcher::find_all`] 区域内多个。开启 `parallel` 后,`RgbMatcher` 用 rayon 把
 扫描按行分到多核,全屏 `find` / `find_all` 在大分辨率下更快(结果与串行完全一致)。
+⚠️ 唯一例外:**平坦**(到处都匹配)画面上的 `find_all` —— 重叠抑制必须按 `(y, x)` 顺序
+流式进行,并行反而会慢几个数量级,库里会自己退回串行(见 v0.8.2 变更)。
 
 ## 等待与窗口 (v0.3)
 ```rust
@@ -176,11 +180,12 @@ finder.find_on_screen(&tpl)?; // trace: op="find_on_screen" backend="dxgi" chang
 > ——想吃到同样性能,请在你项目根 `Cargo.toml` 里也写上这三行(见 `docs/GUIDE.md` 10.4)。
 
 同一台 8 逻辑核机器、`--release` 实测。截图为 1920x1200 真实桌面的连续取帧中位数,
-纯匹配为 `cargo bench --bench match`(1920x1080 合成帧 + 64px 模板):
+纯匹配为 `cargo bench --bench match`(1920x1080 合成帧;单目标用 64px 模板,`find_all`
+用 48px):
 
 | 组合 | 纯匹配 | 截图 | 端到端(截图+匹配) |
 | --- | --- | --- | --- |
-| RGB + `Monitor`(xcap) | 串行 ~3.0ms / `parallel` ~1.7ms | ~34ms | ~36ms |
+| RGB + `Monitor`(xcap) | 串行 ~2.8ms / `parallel` ~1.8ms | ~34ms | ~36ms |
 | RGB + `Gdi` | 同上 | ~32ms | ~34ms |
 | RGB + `Dxgi` | 同上 | ~16ms(静态桌面更低) | ~18ms |
 
@@ -188,8 +193,9 @@ finder.find_on_screen(&tpl)?; // trace: op="find_on_screen" backend="dxgi" chang
 限定区域 + `Monitor` 会走**区域直抓**(400x300 实测截图 ~16.5ms,与"截全屏再裁剪"
 逐字节一致),同一模板端到端从 ~47ms 降到 ~20ms。
 
-掩码与差分另有两个实测数:`rgb_find_masked_1080p`(64px 模板掩掉 6% 像素)~3.4ms,比无掩码
-慢 18% —— 掩码买的是正确性、不是速度;`diff_since_last_400x300_on_1080p` ~3.4ms
+掩码与差分另有两个实测数:`rgb_find_masked_1080p`(64px 模板掩掉 6% 像素)~2.9ms,与同尺寸
+无掩码的 ~2.8ms 只在抖动内 —— 掩码买的是正确性、不是速度(旧文档写的"慢 18%"本机复现
+不出来,已删);`diff_since_last_400x300_on_1080p` ~3.4ms
 (基线缓冲复用之后;复用前 ~5.6ms)。
 
 `Corr`(ZNCC)不受截图后端制约,成本在搜索本身(同样 `cargo bench --features
@@ -197,8 +203,8 @@ match-corr[,parallel] --bench match`):
 
 | 组合 | 热路径(模板已缓存) | 冷启动(含模板编译) |
 | --- | --- | --- |
-| `Corr` | ~13.7ms | ~13.7ms |
-| `Corr` + `parallel`(8 逻辑核) | ~6.6ms | ~6.8ms |
+| `Corr` | ~13.4ms | ~13.7ms |
+| `Corr` + `parallel`(8 逻辑核) | ~6.4ms | ~6.5ms |
 
 模板只做平移匹配(`compile_unrotated`),不建角度模板库,因此冷启动≈热路径;
 开 `parallel` 后 ZNCC 分层并行,约 2x(结果仍确定性)。
@@ -241,6 +247,47 @@ let m = finder.find_on_screen(&Template::load("btn.png")?)?;
   同名字段是**逐金字塔层**的候选门槛,而粗筛层分数天然偏低,拿它当最终阈值会把真命中
   整条链路削空。
 
+## v0.8.2 变更
+
+修订号级别:没有破坏性改动,`find_all` 的**命中集合与顺序和 v0.8.1 逐个字节相同**(测试里
+与朴素 O(n²) 参照逐字节对照过)。改的是"知情权"和一件算法:
+
+- **`find_on_screen` 现在明写:命中不止一处时,你从返回值里看不出来**。它返回扫描序
+  `(y, x)` 的第一个(最上、同样靠上时最靠左)——这个选择是确定的,串行/并行、换后端都给
+  同一个坐标——但 `Some` 只表示"至少有一处"。要判唯一就数到 2:
+
+  ```rust
+  match finder.find_all_on_screen(&tpl, 2)?.len() {
+      0 => {}                                       // 没找到
+      1 => {}                                       // 唯一,可以放心点
+      _ => {}                                       // 不止一处:缩小 region 或换更有特征的模板
+  }
+  ```
+
+  ⚠️ `MatchKind::Corr` 下这个守卫**无效**:`CorrMatcher` 没有覆写 `find_all`,永远只返回
+  1 个,于是它看起来"永远唯一"。
+- **`find_all` 的早停从"行"粒度细化到"列"粒度**:重叠覆盖的判定挪到逐像素验证**之前**
+  (被前面的命中盖住的列直接不验证)、攒够 `max` 当场收工、整行/整块都被覆盖就一行都不扫。
+  平坦画面因此再掉一到四个数量级(1920x1200 纯色帧,`--release`,同一台机器上同一份探针
+  代码、同一场景顺序;`max=0` 的命中数见括号。每格是"该场景只跑一次"的冷启动值):
+
+  | 模板 | `max` | v0.8.1 | v0.8.2 |
+  | --- | --- | --- | --- |
+  | 8x8(36000 命中) | 0 | 串行 571ms / parallel 184.9ms | **串行 ~9.9ms / parallel ~9.8ms** |
+  | 8x8 | 1 | 串行 604µs / parallel 3.41ms | **~83µs / ~77µs**(稳态 ~0.7µs) |
+  | 8x8(唯一性守卫) | 2 | 串行 442µs / parallel 3.10ms | **~7µs / ~7.5µs** |
+  | 240x80(唯一性守卫) | 2 | 串行 104.4ms / parallel 553.2ms | **~147µs / ~147µs** |
+  | 240x80(120 命中) | 0 | 串行 121.0s / parallel 35.3s | **~6.6ms / ~7.5ms** |
+
+  稳态中位数见 `docs/GUIDE.md` 第 10 章的 criterion 交替对拍表(1080p:`max=0` 串行
+  461ms → 8.2ms、parallel 138.2ms → 8.7ms;`max=1` 437.7µs → 0.64µs)。
+- ⚠️ **两点代价,请按需评估**:① 有纹理画面的 `find_all` 慢一点(1080p criterion 交替 6 轮
+  的中位:串行 3.99ms → 4.17ms,+4.5%;parallel 2.59ms → 2.82ms,+9%);② **平坦画面上
+  `parallel` 不再比串行快**——
+  重叠抑制必须严格按 `(y, x)` 顺序增量做,"被覆盖的列免验证"天生是顺序的,行块并行会把它
+  打回逐候选验证(实测:240x80 模板 `max=0`,只做到块粒度早停的并行要 ~7.3s,而串行流式
+  ~6.6ms)。所以这种画面下库里会主动放弃并行。
+
 ## v0.8.1 变更
 
 修订号级别:没有破坏性改动(只新增一个方法),但有四处**行为修正**,升级后结果可能和 0.8.0 不同:
@@ -250,8 +297,10 @@ let m = finder.find_on_screen(&Template::load("btn.png")?)?;
   `find_color_on_screen` 口径一致。依赖旧顺序的代码需要复核。
 - **`find_all` 的去重从二次方改为按行增量,`max` 现在真的限制工作量**。此前 `max` 只截断
   结果长度、扫描和去重照样跑完全程:1920x1200 纯色帧 + 8x8 纯色模板、`max=0`(36000 命中)
-  实测 **23.5 秒**,`max=1` 也要 ~471ms;同一场景现在 **串行 ~347ms / 开 `parallel` ~151ms**,
-  `max=1` 降到 **~0.28ms**(parallel ~2.7ms,并行按行块扫描、块内至少扫完一整块)。
+  实测 **23.5 秒**,`max=1` 也要 ~471ms。当时(v0.8.1)降到 **串行 ~571ms / 开 `parallel`
+  ~185ms**(1920x1200 冷启动单次,与上面 v0.8.2 那表同一协议;这一节早期写的 ~347ms /
+  ~151ms 在本机没能复现,已按复测值改掉),`max=1` ~0.6ms —— v0.8.2 又把它们压到
+  **~9.9ms** 与 **~0.7µs**,见上面 v0.8.2 一节。
   `max` 给 0 的旧代码不会变错,只是从"卡住半小时"变成能跑完。
 - **设了 `region` 且后端支持区域直抓(目前只有 `XCapCapture`)时,静态帧缓存开始生效**。
   此前这条路径把每帧都当"画面变了",于是"盯着一小块反复轮询"时缓存 100% 失效(实测静态
@@ -353,8 +402,10 @@ cargo run --release --features capture-dxgi,capture-gdi --example find_on_screen
 - **平坦内容会让 `Rgb` 退化**:当模板与搜索区域**都**近乎单色(相邻像素几乎没有差异)
   时,锚点与逐像素早失败全部失效,扫描退化为暴力全量。1080p + 64px 实测:有纹理
   ~3ms,零方差模板放在纯色背景上 ~1.9s(慢 600 倍),且平坦区里会有多个"等价"命中点。
-  `find_all` 在这种画面上还会返回**海量命中**(1920x1200 纯色帧 + 8x8 模板实测 36000 个),
-  所以 `max` 请给真实上限,别习惯性写 0。
+  `find_all` 在这种画面上还会返回**海量命中**(1920x1200 纯色帧 + 8x8 模板实测 36000 个,
+  扫描本身现在只要 ~9ms,但这几万个 `Match` 既没意义又占内存),所以 `max` 请给真实上限,
+  别习惯性写 0;只想确认"是不是只有一处"的话 `max = 2` 就够。
+  同样,`find_on_screen` 在这种画面上给的 `Some` 只是**最上最左**的那个,不代表唯一。
   裁模板请选**有边缘、有纹理**的区域,别从纯色背景上切一块。
 
 ## 说明:内容由 AI 生成

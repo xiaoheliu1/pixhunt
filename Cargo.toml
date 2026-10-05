@@ -1,6 +1,6 @@
 [package]
 name = "pixhunt"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 # resolver 3:生成 Cargo.lock 时按 MSRV 选兼容的依赖版本,而不是无脑拿最新,
 # 否则 rust-version 声明会被上游依赖的新版本悄悄推翻(见 CI 的 msrv job)。

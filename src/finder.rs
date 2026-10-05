@@ -105,6 +105,35 @@ impl Finder {
     ///
     /// 命中时 `Match::score` 的口径随匹配器不同:`MatchKind::Rgb` 恒为 `1.0`,只有
     /// `Corr`(ZNCC,需 feature `match-corr`)的分数才表示"有多像"。
+    ///
+    /// ⚠️ **屏幕上命中不止一处时,这里不告诉你"还有第二个"**。返回的一定是扫描序
+    /// `(y, x)` 里的第一个(最靠上;同样靠上时最靠左)——确定性强,串行/并行、换后端都
+    /// 一致,但它是"最上最左的那个",不是"唯一的那个"。同款按钮出现两次、或模板是从
+    /// 大片纯色区域裁出来的时候,`Some` 照样会给你坐标。
+    ///
+    /// 在意唯一性就用 [`Finder::find_all_on_screen`] 取 2 个来判:
+    ///
+    /// ```no_run
+    /// # use pixhunt::{Error, Finder, Template};
+    /// # fn demo() -> Result<(), Error> {
+    /// let tpl = Template::load("btn.png")?;
+    /// let mut finder = Finder::builder().build()?;
+    /// match finder.find_all_on_screen(&tpl, 2)?.len() {
+    ///     0 => println!("没找到"),
+    ///     1 => println!("唯一,可以放心点"),
+    ///     _ => println!("不止一处,这个坐标不可信,考虑缩小 region"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// 这个守卫不额外贵:它扫到第二个命中就停,代价与再搜一遍同量级(1920x1200 有纹理
+    /// 帧 + 48x48 模板、`--release` 纯匹配 15 次取中位:命中两处时 ~3.3ms 串行 / ~2.2ms
+    /// 开 `parallel`;而"确实唯一"时必须扫完整帧才敢下结论,~4.7ms / ~3.1ms)。如果模板
+    /// 是从大片纯色里裁的、屏幕上**到处**都匹配,它扫到第 2 行就收工,比上面还便宜三个
+    /// 数量级(同尺寸纯色帧实测 ~1µs)。⚠️ 唯一的例外是 `MatchKind::Corr`:
+    /// `CorrMatcher`(feature `match-corr`)没有覆写 [`Matcher::find_all`],
+    /// 永远只返回 1 个,这个守卫在它下面**恒判"唯一"**。
     pub fn find_on_screen(&mut self, tpl: &Template) -> Result<Option<Match>> {
         let _t0 = px_timer!();
         let (changed, origin) = self.grab_scoped()?;
@@ -243,6 +272,9 @@ impl Finder {
     /// 返回**屏幕绝对坐标**。
     ///
     /// 顺序与去重口径见 [`Matcher::find_all`];中心点可用 [`Match::center`] 折算。
+    ///
+    /// `max` 是**真上限**,攒够就停止扫描(不会先把整屏扫完再截断),所以拿它当
+    /// "命中是否唯一"的守卫(`max = 2`)很便宜,见 [`Finder::find_on_screen`]。
     pub fn find_all_on_screen(&mut self, tpl: &Template, max: usize) -> Result<Vec<Match>> {
         let (_, origin) = self.grab_scoped()?;
         let region = self.search_rect(origin);
@@ -275,6 +307,9 @@ impl Finder {
     /// 命中时 `Match.x`/`Match.y` = 左上角 + 宽高的一半(整数除法)。
     /// 适合"找到后直接点击中心"的场景。多结果要用中心点,请对 [`find_all_on_screen`]
     /// 的每个命中调用 [`Match::center`]。
+    ///
+    /// "命中不止一处时不告知"这一点与 [`Finder::find_on_screen`] 完全一致(它就是
+    /// 在后者结果上折算坐标)。
     ///
     /// [`find_all_on_screen`]: Finder::find_all_on_screen
     pub fn find_center_on_screen(&mut self, tpl: &Template) -> Result<Option<Match>> {
