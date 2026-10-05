@@ -140,12 +140,19 @@ impl DxgiInner {
         unsafe {
             let mut res: Option<IDXGIResource> = None;
             let mut fi = std::mem::zeroed::<DXGI_OUTDUPL_FRAME_INFO>();
+            // acquire 成功就等于占用了一帧,**必须** ReleaseFrame,哪怕这一帧没带
+            // 资源(res 为 None)。漏掉一次会让后续的 AcquireNextFrame 一直失败,
+            // 表现与"复制对象失效"相同、却比它更难查。
+            let mut acquired = false;
             let fresh =
                 match self
                     .duplication
                     .AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &mut fi, &mut res)
                 {
-                    Ok(()) => res.is_some(),
+                    Ok(()) => {
+                        acquired = true;
+                        res.is_some()
+                    }
                     // WAIT_TIMEOUT 的含义是"自上次以来画面没变",属正常路径。
                     Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => false,
                     // 其余错误(ACCESS_LOST / DEVICE_REMOVED / 显示模式改变)意味着复制
@@ -153,6 +160,9 @@ impl DxgiInner {
                     // **永远看到失效前的旧画面**——所以这里重建并立刻再取一次。
                     // 代价:刚重建好、系统还没推新帧时,本帧可能是全零(黑),下一帧起正常。
                     Err(_) => {
+                        // 失败调用是否仍会写入资源,取决于上游实现;这里先丢弃一次
+                        // (释放那个 COM 引用),重试就不可能悄悄漏掉一个引用计数。
+                        res = None;
                         self.rebuild_duplication().map_err(|e| {
                             Error::capture(format!("dxgi duplication rebuild failed: {e}"))
                         })?;
@@ -161,12 +171,15 @@ impl DxgiInner {
                             &mut fi,
                             &mut res,
                         ) {
-                            Ok(()) => res.is_some(),
+                            Ok(()) => {
+                                acquired = true;
+                                res.is_some()
+                            }
                             Err(_) => false,
                         }
                     }
                 };
-            if fresh {
+            if acquired {
                 if let Some(r) = res.take() {
                     if let Ok(tex) = r.cast::<ID3D11Texture2D>() {
                         self.context.CopyResource(&self.staging, &tex);
