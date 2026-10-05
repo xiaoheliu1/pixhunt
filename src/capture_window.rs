@@ -84,6 +84,9 @@ impl PrintCap {
                 "window has an empty client area (minimized?)",
             ));
         }
+        // 保证缓冲够长:下面的 GetDIBits 会按裸指针直写 w*h*4 字节。
+        // 长度已够时 resize 是 no-op(调用方 prepare_* 已备好,不重新分配)。
+        dst.resize(self.w * self.h * 4, 0);
         unsafe {
             // PW_RENDERFULLCONTENT(2):让 DirectComposition/Chromium 系窗口也走渲染路径。
             let ok: BOOL = PrintWindow(

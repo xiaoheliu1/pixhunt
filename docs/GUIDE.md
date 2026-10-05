@@ -649,7 +649,13 @@ if let Some(m) = finder.find_center_on_screen(&tpl)? {
 - 首次调用(无基线)返回 `rect.width * rect.height`(视为"全部变了")。
 - 比较 R/G/B 三通道(忽略 Alpha),任一通道不等就算"不同"。
 - 调用后当前帧成为下一次比较的基线。
+- **两次之间帧的布局变了**(用 `set_region` 换过区域大小、显示器分辨率被改、换了
+  后端)时,像素不再一一对应,同样返回 `rect.width * rect.height`(整片都变)并重建
+  基线,下一次调用起恢复正常计数。所以别把"切区域后的第一个返回值"当成真实变化量。
 - 用途:判断"这块区域动画停了没""有没有新消息红点亮起"。
+- 成本:为了下次能对比,库会把**当前整帧**留一份副本(1080p 约 8 MB),所以它是
+  "每调用一次拷一份"的量级。拿它做 60 fps 级高频轮询并不合适——那种场景请用带
+  `region` 的 `find_on_screen`(静态画面会命中结果缓存),或把调用间隔放到 50 ms 以上。
 
 ```rust
 let changed = finder.diff_since_last(Rect::new(100, 100, 200, 50))?;
@@ -852,6 +858,16 @@ pub fn with_mask(self, mask: Vec<bool>) -> Self   // builder-style
 
 ⚠️ `from_rgb` 内部有 `assert_eq!(rgb.len(), width * height * 3)`,长度不对**直接 panic**。
 `from_rgba` 同理(`width * height * 4`)。从别处搬来的字节先确认长度。
+`with_mask` 也一样会 `assert_eq!(mask.len(), width * height)`。
+
+关于掩码,还有两件事必须知道:
+
+- **只有 `RgbMatcher` 认掩码。** `CorrMatcher`(ZNCC)走整块灰度相关,拿不到掩码接口,
+  被掩掉的像素(透明区)仍会带着它自己的 RGB 参与打分,结果可能和 `RgbMatcher` 不一致。
+  debug 构建下会触发 `debug_assert!` 提示你;release 构建不拦。要用掩码就配 `RgbMatcher`。
+- **`find_all` 的"不重叠"按模板外接框判定**(见 8.1.4)。如果模板框很大而可见部分只占
+  中间一小块(四周全透明),挨着排的两个目标会因为外接框相交而只报出一个。解决办法是把
+  模板裁紧:只保留可见范围那圈像素。
 
 #### 8.4.4 `Template::content_key(&self) -> u64` 与 `to_gray(&self) -> Vec<u8>`
 
@@ -951,8 +967,8 @@ impl GdiCapture { pub fn new_primary() -> Self }     // 注意:不返回 Result 
 - 用 `GetDC(NULL)` + `BitBlt` + `GetDIBits`,输出 **BGRA**。
 - 只覆盖主屏;尺寸在构造时由 `GetDeviceCaps(HORZRES/VERTRES)` 决定 —— 分辨率/DPI 缩放改变后
   **需要重建实例**才会跟上。
-- ⚠️ **需要知道的行为**:`grab_into` 内部对 `GetDIBits` 失败用的是 `assert!`,也就是说
-  真失败时会 **panic**(而不是返回 `Err`)。这是当前实现较粗糙的一处。要稳定请用 `Monitor` 或 `Dxgi`。
+- `BitBlt` / `GetDIBits` 失败时返回 `Err`(v0.8 起;更早的版本这里是 `assert!`,会直接
+  panic,现已与 `Dxgi` / `Window` 后端统一成错误返回)。详见 11.5。
 - `grab_into` 恒返回 `true`,所以 GDI 后端**享受不到**静态画面跳过。
 
 #### 8.5.4 `DxgiCapture` 〔f:capture-dxgi〕(仅 Windows,最快)
@@ -1657,13 +1673,18 @@ Add-Type -AssemblyName System.Drawing
 [System.Drawing.Image]::FromFile("D:\pic\a.jpg").Save("D:\pic\a.png", [System.Drawing.Imaging.ImageFormat]::Png)
 ```
 
-### 11.5 `panic: GetDIBits 失败`(用 `capture-gdi` 时)
+### 11.5 `capture error: BitBlt failed` / `GetDIBits failed`(用 `capture-gdi` 时)
 
-GDI 后端在 `GetDIBits` 返回 0 时走的是 `assert!`,会直接 panic(见 8.5.3)。常见诱因:
-桌面正在切换(锁屏/休眠唤醒瞬间)、GDI 资源被系统限制。
+GDI 后端在 `BitBlt` 或 `GetDIBits` 失败时返回 `Err`(见 8.5.3)。v0.8 之前这里走的是
+`assert!`,会直接把进程 panic 掉;现在统一成错误,`?` 往上抛即可,不会再打断程序。
 
-- 稳妥做法:改用 `CaptureKind::Auto` 或 `Monitor`(它们失败会返回 `Err`)。
-- 你的程序要防 panic 中断,可以把找图放在 `std::panic::catch_unwind` 里,或干脆换后端。
+常见诱因:桌面正在切换(锁屏 / 休眠唤醒的瞬间)、GDI 资源被系统限制。
+
+- 偶发一次:当作可重试的瞬时错误,下一帧再抓即可。
+- 持续失败:说明当前会话拿不到桌面(无人登录 / 会话被隔离),换 `CaptureKind::Auto`
+  或 `Monitor` 也一样会失败,该修的是运行环境而不是代码。
+- 顺带注意:改分辨率 / DPI 缩放后 `GdiCapture` **不会自己跟上**(实例尺寸在构造时定死),
+  需要重建 `Finder`;表现是画面错位、找图莫名全灭。
 
 ### 11.6 `capture error: DXGI desktop duplication unavailable`
 
@@ -1853,7 +1874,7 @@ pixhunt::template   Template
 | **`Option<T>` / `Result<T, E>`** | "可能有/没有" / "可能成功/失败"。Rust 用它代替 null 和异常 |
 | **`?`** | 出错就提前返回错误,成功就继续。只能用在返回 `Result`/`Option` 的函数里 |
 | **`&mut self`** | 该方法会改动调用者所属的对象,所以变量要 `mut` |
-| **panic** | 程序遇到无法继续的硬错误直接中止。本库唯一可能 panic 的点见 11.5 |
+| **panic** | 程序遇到无法继续的硬错误直接中止。本库只在用 `Template::from_rgb` / `from_rgba` / `with_mask` 传的字节长度与尺寸不符时 panic(见 8.4.3);截图失败、找不到模板一律走 `Err` / `Ok(None)`,不会 panic |
 
 ---
 

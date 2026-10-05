@@ -48,7 +48,16 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// 用 RGBA 字节建帧。`pixels.len()` **必须**等于 `width * height * 4`,
+    /// 否则后续匹配/裁剪会读到缓冲区之外(debug 构建下会断言失败)。
     pub fn rgba8(width: usize, height: usize, pixels: Vec<u8>) -> Self {
+        debug_assert_eq!(
+            pixels.len(),
+            width * height * 4,
+            "Frame::rgba8: pixels 长度({}) != width*height*4({})",
+            pixels.len(),
+            width * height * 4
+        );
         Frame {
             width,
             height,
@@ -57,7 +66,16 @@ impl Frame {
         }
     }
 
+    /// 用 BGRA 字节建帧。`pixels.len()` **必须**等于 `width * height * 4`,
+    /// 否则后续匹配/裁剪会读到缓冲区之外(debug 构建下会断言失败)。
     pub fn bgra8(width: usize, height: usize, pixels: Vec<u8>) -> Self {
+        debug_assert_eq!(
+            pixels.len(),
+            width * height * 4,
+            "Frame::bgra8: pixels 长度({}) != width*height*4({})",
+            pixels.len(),
+            width * height * 4
+        );
         Frame {
             width,
             height,

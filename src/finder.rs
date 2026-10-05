@@ -245,12 +245,23 @@ impl Finder {
     ///
     /// 用途:"这块区域变了吗?""动画是否还在跑?""有没有新消息图标闪了一下"。
     /// 比较时使用 R/G/B 三通道(忽略 Alpha),任一通道差值 !=0 即计为不同。
+    ///
+    /// 注意:两次截图之间**帧布局发生变化**(切换过 `region`、显示器分辨率改变、
+    /// 换了后端)时,像素不再一一对应,此时保守返回区域内全部像素数(=整片都变),
+    /// 并把当前帧立为新基线;下一次调用起恢复正常计数。
+    ///
+    /// 成本:为供下次对比,这里会保留**当前整帧**的一份副本(1080p 约 8 MB),
+    /// 属于"每调用一次拷一份"的量级,不适合 60 fps 级高频轮询。
     pub fn diff_since_last(&mut self, rect: Rect) -> Result<u32> {
         let _ = self.grab_scoped()?;
         let r = self.frame.clamp(rect);
-        let count = match &self.prev_frame {
-            None => (r.width * r.height) as u32,
-            Some(prev) => {
+        let count = match self.prev_frame.as_ref() {
+            // 两帧布局一致(尺寸 + 像素格式)时,下标才对应同一个屏幕位置,可逐像素比。
+            Some(prev)
+                if prev.width == self.frame.width
+                    && prev.height == self.frame.height
+                    && prev.format == self.frame.format =>
+            {
                 let (ro, go, bo) = self.frame.rgb_offsets();
                 let (pro, pgo, pbo) = prev.rgb_offsets();
                 let sw4 = self.frame.width * 4;
@@ -270,6 +281,10 @@ impl Finder {
                 }
                 diff
             }
+            // 无基线,或布局变了(切换过 region、分辨率改变、换了后端):`r` 是按
+            // 当前帧裁剪的,拿它去索引更小的上一帧会越界 panic,同下标也不再指向
+            // 同一屏幕位置。保守视为"区域内全部像素都变化",并把当前帧立为新基线。
+            _ => (r.width * r.height) as u32,
         };
         // 当前帧变为下次比较的基线
         self.prev_frame = Some(self.frame.clone());
@@ -752,5 +767,37 @@ mod tests {
         let _ = f.diff_since_last(Rect::new(0, 0, 32, 32)).unwrap();
         let d = f.diff_since_last(Rect::new(0, 0, 32, 32)).unwrap();
         assert!(d > 0, "两帧不同应检出变化,got {}", d);
+    }
+
+    /// 支持 `grab_region`、按请求尺寸给帧的 mock(真实后端切换区域时帧尺寸会变)。
+    struct RegionCapture;
+    impl Capture for RegionCapture {
+        fn grab(&mut self) -> Result<Frame> {
+            Ok(Frame::bgra8(64, 64, vec![9u8; 64 * 64 * 4]))
+        }
+        fn grab_region(&mut self, r: Rect) -> Result<Option<Frame>> {
+            Ok(Some(Frame::bgra8(
+                r.width,
+                r.height,
+                vec![9u8; r.width * r.height * 4],
+            )))
+        }
+    }
+
+    #[test]
+    fn diff_since_last_survives_region_resize() {
+        // 回归:先在 8x8 小区域建基线(上一帧仅 256 像素),再切到 64x64 大区域,
+        // 用大帧的下标去索引小帧缓冲会越界 panic。
+        let mut f = Finder::new(Box::new(RegionCapture), Box::new(RgbMatcher::new(0)));
+        f.set_region(Some(Rect::new(0, 0, 8, 8)));
+        let _ = f.diff_since_last(Rect::new(0, 0, 8, 8)).unwrap();
+
+        f.set_region(Some(Rect::new(0, 0, 64, 64)));
+        let d = f.diff_since_last(Rect::new(0, 0, 16, 16)).unwrap();
+        assert_eq!(d, 16 * 16, "两帧布局不同应保守报告整片变化");
+
+        // 基线已重建为同一布局,内容未变时应回到 0
+        let d2 = f.diff_since_last(Rect::new(0, 0, 16, 16)).unwrap();
+        assert_eq!(d2, 0);
     }
 }

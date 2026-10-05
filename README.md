@@ -223,6 +223,8 @@ let m = finder.find_on_screen(&Template::load("btn.png")?)?;
 - **`diff_since_last(rect)`**:对比上一次截图,返回指定区域内颜色有变的像素数。
 - **`CaptureKind::WindowByTitle(..)`**:`FinderBuilder` 直接按窗口标题精确匹配截窗口,无需先拿句柄。
 - **图片格式扩展**:`Template::load` 现支持 **PNG + JPEG + WebP**(之前仅 PNG)。
+- **GDI 后端不再 panic**:`BitBlt` / `GetDIBits` 失败(锁屏、休眠唤醒瞬间等)改为返回
+  `Err`,与 DXGI / Window 后端行为一致。之前这里会 `assert!` 直接中止进程。
 
 ## 升级到 v0.7 (breaking)
 `Error::Capture` 改成命名字段变体,让截图失败能保住**错误链**:

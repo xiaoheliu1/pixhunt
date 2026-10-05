@@ -175,6 +175,13 @@ impl Default for CorrMatcher {
 
 impl Matcher for CorrMatcher {
     fn find(&self, frame: &Frame, tpl: &Template) -> Option<Match> {
+        // ZNCC 是整块灰度相关,corrmatch 没有掩码接口:带掩码的模板里被掩掉的
+        // 像素(透明区)仍会连同其 RGB 参与打分,结果可能与 RgbMatcher 不一致。
+        // 不静默——debug 构建下明确提示,release 构建零开销。
+        debug_assert!(
+            tpl.mask.is_none(),
+            "CorrMatcher 不支持带掩码的模板:透明区域会参与 ZNCC 打分,请改用 RgbMatcher"
+        );
         self.ensure_compiled(tpl)?;
 
         // 帧灰度 -> 复用的 scratch 缓冲
