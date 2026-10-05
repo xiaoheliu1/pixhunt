@@ -7,7 +7,7 @@
 //!   cargo bench --features match-corr,parallel   # ZNCC 路径
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use pixhunt::{Frame, Matcher, RgbMatcher, Template};
+use pixhunt::{Capture, Finder, Frame, Matcher, Rect, RgbMatcher, Template};
 
 fn make_frame(w: usize, h: usize) -> Frame {
     let mut px = vec![0u8; w * h * 4];
@@ -47,6 +47,56 @@ fn bench_find(c: &mut Criterion) {
     let m = RgbMatcher::new(0);
     c.bench_function("rgb_find_fullscreen_1080p", |b| {
         b.iter(|| black_box(&m).find(black_box(&frame), black_box(&tpl)))
+    });
+}
+
+/// 带掩码的匹配:透明区在锚点预筛与短路校验里都被跳过。
+/// 与 `rgb_find_fullscreen_1080p` 对比即可判断掩码路径有没有引入退化。
+fn bench_find_masked(c: &mut Criterion) {
+    let (w, h) = (1920usize, 1080usize);
+    let mut frame = make_frame(w, h);
+    let rgb = embed(&mut frame, 1200, 640, 64);
+    // 掩掉模板正中 16x16(约 6% 像素),模拟"图标中间有个会变的徽标"。
+    let mut mask = vec![true; 64 * 64];
+    for y in 24..40 {
+        for x in 24..40 {
+            mask[y * 64 + x] = false;
+        }
+    }
+    let tpl = Template::from_rgb(rgb, 64, 64).with_mask(mask);
+    let m = RgbMatcher::new(0);
+    c.bench_function("rgb_find_masked_1080p", |b| {
+        b.iter(|| black_box(&m).find(black_box(&frame), black_box(&tpl)))
+    });
+}
+
+/// 只回放固定帧的假后端:让 `diff_since_last` 的耗时里不含真实截图成本,
+/// 只剩逐像素比较 + 基线整帧 clone,便于判断长时间运行时这项分配占比。
+struct StaticCapture {
+    frame: Frame,
+}
+
+impl Capture for StaticCapture {
+    fn grab(&mut self) -> pixhunt::Result<Frame> {
+        Ok(self.frame.clone())
+    }
+}
+
+fn bench_diff_since_last(c: &mut Criterion) {
+    let frame = make_frame(1920, 1080);
+    let mut finder = Finder::new(
+        Box::new(StaticCapture { frame }),
+        Box::new(RgbMatcher::new(0)),
+    );
+    let rect = Rect::new(0, 0, 400, 300);
+    // 首次调用建立基线(尚无上一帧),之后每步都走"两帧布局相同"的逐像素比较分支。
+    finder.diff_since_last(rect).unwrap();
+    c.bench_function("diff_since_last_400x300_on_1080p", |b| {
+        b.iter(|| {
+            black_box(&mut finder)
+                .diff_since_last(black_box(rect))
+                .unwrap()
+        })
     });
 }
 
@@ -116,8 +166,21 @@ fn bench_corr(c: &mut Criterion) {
 }
 
 #[cfg(feature = "match-corr")]
-criterion_group!(benches, bench_find, bench_find_all, bench_corr);
+criterion_group!(
+    benches,
+    bench_find,
+    bench_find_masked,
+    bench_find_all,
+    bench_diff_since_last,
+    bench_corr
+);
 #[cfg(not(feature = "match-corr"))]
-criterion_group!(benches, bench_find, bench_find_all);
+criterion_group!(
+    benches,
+    bench_find,
+    bench_find_masked,
+    bench_find_all,
+    bench_diff_since_last
+);
 
 criterion_main!(benches);

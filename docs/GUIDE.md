@@ -544,6 +544,7 @@ let hit = finder.find_on_screen(&Template::load("btn.png")?)?;
 - `max`:最多要几个。`max = 0` 表示**不限**。
 - "不重叠"的定义:两个命中如果在 x 方向相差小于模板宽度**且** y 方向相差小于模板高度,
   就算同一个目标,只留先遇到的那个。所以同一个图标挨着排开不会返回一堆半重叠的假命中。
+  (模板带掩码时,这里的宽高取**可见区**的外接框而非整张模板,见 8.4.3。)
 - ⚠️ **用 `CorrMatcher` 时它只返回 1 个**。原因:`find_all` 在 `Matcher` trait 里有个基于
   裁剪的默认实现,只转发单个 `find`;`RgbMatcher` 覆写了它,`CorrMatcher` 没有(见 8.6.1)。
   要"多目标 + 抗光照"目前得自己移动 `region` 分次找。
@@ -653,9 +654,11 @@ if let Some(m) = finder.find_center_on_screen(&tpl)? {
   后端)时,像素不再一一对应,同样返回 `rect.width * rect.height`(整片都变)并重建
   基线,下一次调用起恢复正常计数。所以别把"切区域后的第一个返回值"当成真实变化量。
 - 用途:判断"这块区域动画停了没""有没有新消息红点亮起"。
-- 成本:为了下次能对比,库会把**当前整帧**留一份副本(1080p 约 8 MB),所以它是
-  "每调用一次拷一份"的量级。拿它做 60 fps 级高频轮询并不合适——那种场景请用带
-  `region` 的 `find_on_screen`(静态画面会命中结果缓存),或把调用间隔放到 50 ms 以上。
+- 成本:为了下次能对比,库要把**当前整帧**留一份基线副本(1080p BGRA 约 8 MB)。这份缓冲
+  会被**复用**(尺寸没变时就地覆盖,不重新分配):`cargo bench` 里的
+  `diff_since_last_400x300_on_1080p` 实测 3.4 ms(改成复用之前是 5.6 ms),而这个数字里
+  还含着基准用的假后端每次重新交出一份整帧的成本。真要密集轮询,给 `Finder` 设 `region`
+  只抓那一块,比较和副本就都只按区域大小计。
 
 ```rust
 let changed = finder.diff_since_last(Rect::new(100, 100, 200, 50))?;
@@ -865,9 +868,14 @@ pub fn with_mask(self, mask: Vec<bool>) -> Self   // builder-style
 - **只有 `RgbMatcher` 认掩码。** `CorrMatcher`(ZNCC)走整块灰度相关,拿不到掩码接口,
   被掩掉的像素(透明区)仍会带着它自己的 RGB 参与打分,结果可能和 `RgbMatcher` 不一致。
   debug 构建下会触发 `debug_assert!` 提示你;release 构建不拦。要用掩码就配 `RgbMatcher`。
-- **`find_all` 的"不重叠"按模板外接框判定**(见 8.1.4)。如果模板框很大而可见部分只占
-  中间一小块(四周全透明),挨着排的两个目标会因为外接框相交而只报出一个。解决办法是把
-  模板裁紧:只保留可见范围那圈像素。
+- **`find_all` 的"不重叠"按可见像素的外接框判定**(见 8.1.4):模板带掩码时,用的是**没被
+  掩掉那部分像素**围出来的框,而不是整张模板的外接框。所以一张 64x64、只有角上 16x16
+  不透明的模板,相距 40 px 的两个目标会各自报出(更早的版本按整张 64x64 判定,会只剩一个)。
+  极端情况下掩码把整个模板都掩掉(没有可见像素),退回按整张模板判定。
+- 掩码**不是提速手段**:1080p 上 64x64 模板掩掉 6% 像素,`rgb_find_masked_1080p` 实测
+  3.44 ms,而同尺寸无掩码的 `rgb_find_fullscreen_1080p` 是 2.92 ms —— 带掩码反而慢 18%,
+  因为每个采样点都要多查一次掩码。它的价值在于**正确性**(忽略会变的区域)。要提速请用
+  `region` 缩小搜索范围。
 
 #### 8.4.4 `Template::content_key(&self) -> u64` 与 `to_gray(&self) -> Vec<u8>`
 
@@ -965,8 +973,10 @@ impl GdiCapture { pub fn new_primary() -> Self }     // 注意:不返回 Result 
 ```
 
 - 用 `GetDC(NULL)` + `BitBlt` + `GetDIBits`,输出 **BGRA**。
-- 只覆盖主屏;尺寸在构造时由 `GetDeviceCaps(HORZRES/VERTRES)` 决定 —— 分辨率/DPI 缩放改变后
-  **需要重建实例**才会跟上。
+- 只覆盖主屏。**每次抓取前会比对一次桌面尺寸**(`GetDeviceCaps(HORZRES/VERTRES)`),
+  分辨率 / DPI 缩放改变、换了主显示器之后会自行重建位图跟上(v0.8 起;更早的版本尺寸在
+  构造时定死,改完分辨率会一直输出错位画面)。实测这两次查询的影响不可分辨
+  (`find_on_screen` P50:加检测前 33.33 ms,加检测后 33.60 ms)。
 - `BitBlt` / `GetDIBits` 失败时返回 `Err`(v0.8 起;更早的版本这里是 `assert!`,会直接
   panic,现已与 `Dxgi` / `Window` 后端统一成错误返回)。详见 11.5。
 - `grab_into` 恒返回 `true`,所以 GDI 后端**享受不到**静态画面跳过。
@@ -983,6 +993,10 @@ impl DxgiCapture { pub fn new_primary() -> Option<Self> }   // None = 桌面复�
   常见原因是远程桌面(RDP)、锁屏、无 GPU、显卡不支持复制。用 `CaptureKind::Dxgi` 时它会变成
   一个明确的 `Err`。
 - 另有限制:桌面复制**每秒最多一帧**,轮询频率再高也不会更快(多余轮次得到 `false`)。
+- 复制对象会**失效**:改分辨率、锁屏 / 休眠唤醒、显卡设备重置都会让它报错。v0.8 起库会
+  自己重建一份并立刻重取,不需要你重建 `Finder`(更早的版本会把这种报错当成"画面没变",
+  于是之后每次抓到的都是失效前的旧画面,永远不变)。代价是刚重建完、系统还没推新帧时,
+  这一帧可能是全黑,下一帧起就正常了。
 
 ```rust
 let mut cap = pixhunt::DxgiCapture::new_primary()
@@ -1683,8 +1697,8 @@ GDI 后端在 `BitBlt` 或 `GetDIBits` 失败时返回 `Err`(见 8.5.3)。v0.8 �
 - 偶发一次:当作可重试的瞬时错误,下一帧再抓即可。
 - 持续失败:说明当前会话拿不到桌面(无人登录 / 会话被隔离),换 `CaptureKind::Auto`
   或 `Monitor` 也一样会失败,该修的是运行环境而不是代码。
-- 顺带注意:改分辨率 / DPI 缩放后 `GdiCapture` **不会自己跟上**(实例尺寸在构造时定死),
-  需要重建 `Finder`;表现是画面错位、找图莫名全灭。
+- 顺带注意:v0.8 起 `GdiCapture` 每次抓取前会检查桌面尺寸,变了就自行重建,不用你再重建
+  `Finder`(更早的版本会一直输出错位画面,表现为找图莫名全灭)。
 
 ### 11.6 `capture error: DXGI desktop duplication unavailable`
 

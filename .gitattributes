@@ -1,0 +1,27 @@
+# 统一行尾:仓库内一律以 LF 存储。
+# 没有这个文件时,结果取决于各人机器的 core.autocrlf —— 同一份代码在
+# Windows 上 checkout 出 CRLF,提交时会看到"整文件都改了"的假 diff,
+# 而 CI(Linux)与工作区行尾不一致还会让 cargo fmt 的 --check 时灵时不灵。
+* text=auto eol=lf
+
+# Windows 脚本保持 CRLF:记事本/旧版 cmd.exe 对纯 LF 的批处理处理不稳。
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# 二进制文件禁止任何行尾转换(被当文本转换会直接损坏)。
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.bmp  binary
+*.ttf  binary
+*.otf  binary
+*.zip  binary
+*.gz   binary
+*.pdf  binary
+
+# 这些扩展名交给 linguist 正确识别语言(GitHub 统计与 diff 渲染更准)。
+*.rs   text diff=rust
+*.toml text

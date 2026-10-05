@@ -287,7 +287,17 @@ impl Finder {
             _ => (r.width * r.height) as u32,
         };
         // 当前帧变为下次比较的基线
-        self.prev_frame = Some(self.frame.clone());
+        // 基线就地更新:缓冲等长时复用上一帧那个 Vec,避免每帧重新分配整帧
+        // (1080p BGRA 约 8 MB;实测这次分配+拷贝占了 diff_since_last 的大部分时间)。
+        match self.prev_frame.as_mut() {
+            Some(prev) if prev.pixels.len() == self.frame.pixels.len() => {
+                prev.pixels.copy_from_slice(&self.frame.pixels);
+                prev.width = self.frame.width;
+                prev.height = self.frame.height;
+                prev.format = self.frame.format;
+            }
+            _ => self.prev_frame = Some(self.frame.clone()),
+        }
         Ok(count)
     }
 

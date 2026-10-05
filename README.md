@@ -167,6 +167,10 @@ finder.find_on_screen(&tpl)?; // trace: op="find_on_screen" backend="dxgi" chang
 限定区域 + `Monitor` 会走**区域直抓**(400x300 实测截图 ~16.5ms,与"截全屏再裁剪"
 逐字节一致),同一模板端到端从 ~47ms 降到 ~20ms。
 
+掩码与差分另有两个实测数:`rgb_find_masked_1080p`(64px 模板掩掉 6% 像素)~3.4ms,比无掩码
+慢 18% —— 掩码买的是正确性、不是速度;`diff_since_last_400x300_on_1080p` ~3.4ms
+(基线缓冲复用之后;复用前 ~5.6ms)。
+
 `Corr`(ZNCC)不受截图后端制约,成本在搜索本身(同样 `cargo bench --features
 match-corr[,parallel] --bench match`):
 
@@ -225,6 +229,12 @@ let m = finder.find_on_screen(&Template::load("btn.png")?)?;
 - **图片格式扩展**:`Template::load` 现支持 **PNG + JPEG + WebP**(之前仅 PNG)。
 - **GDI 后端不再 panic**:`BitBlt` / `GetDIBits` 失败(锁屏、休眠唤醒瞬间等)改为返回
   `Err`,与 DXGI / Window 后端行为一致。之前这里会 `assert!` 直接中止进程。
+- **截图后端会自己跟上桌面尺寸变化**:GDI 每次抓取前比对桌面分辨率,变了就重建位图;DXGI
+  在复制对象失效(改分辨率、锁屏 / 休眠唤醒、显卡重置)后自动重建并重取。之前 GDI 会一直
+  输出错位画面、DXGI 会**永远停在失效前的旧帧**。
+- **`find_all` 对带掩码的模板按可见区外接框去重**:此前按整张模板外接框判定,大模板 +
+  小图标会把相邻目标漏报成一个。
+- **`diff_since_last` 复用基线缓冲**,不再每次重新分配整帧:1080p 实测 5.6 ms → 3.4 ms。
 
 ## 升级到 v0.7 (breaking)
 `Error::Capture` 改成命名字段变体,让截图失败能保住**错误链**:

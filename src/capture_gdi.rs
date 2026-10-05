@@ -59,12 +59,41 @@ impl FastCap {
         (self.w, self.h)
     }
 
+    /// 桌面尺寸变化(改分辨率、改缩放比例、切换主显示器、RDP 重连)后重建位图与 bmi。
+    ///
+    /// 不处理的话后果很隐蔽:位图还是旧尺寸,`BitBlt` 只填旧区域、`GetDIBits` 又按旧
+    /// `bmi` 读,画面从此**错位且不会自行恢复**,除非重建整个 `GdiCapture`。
+    /// 代价是每次抓取多两次 `GetDeviceCaps` 调用,实测可忽略。
+    fn resize_if_needed(&mut self) {
+        unsafe {
+            let w = GetDeviceCaps(self.hdc_screen, HORZRES) as usize;
+            let h = GetDeviceCaps(self.hdc_screen, VERTRES) as usize;
+            if w == 0 || h == 0 || (w == self.w && h == self.h) {
+                return;
+            }
+            let new_hbmp = CreateCompatibleBitmap(self.hdc_screen, w as i32, h as i32);
+            if new_hbmp.is_invalid() {
+                // 建不出来就沿用旧对象,让后面的 BitBlt / GetDIBits 走正常报错路径。
+                return;
+            }
+            // 换入新位图;被换出的那张此刻不属于任何 DC,可以安全删除。
+            SelectObject(self.hdc_mem, new_hbmp);
+            let _ = DeleteObject(self.hbmp);
+            self.hbmp = new_hbmp;
+            self.bmi.bmiHeader.biWidth = w as i32;
+            self.bmi.bmiHeader.biHeight = -(h as i32); // 负 = 自顶向下
+            self.w = w;
+            self.h = h;
+        }
+    }
+
     /// 抓一帧,BGRA 直接写入 `dst`。`dst` 会被就地扩到 `w*h*4`(长度已够时
     /// `resize` 是 no-op,复用原容量、不重新分配)。
     ///
     /// GDI 失败返回 `Err` 而**不是 panic**:显示器休眠、分辨率切换、无人登录的
     /// 活动会话等瞬态场景都是可恢复错误,不该让调用方进程跟着崩。
     fn grab_into(&mut self, dst: &mut Vec<u8>) -> Result<()> {
+        self.resize_if_needed();
         // 先保证长度:GetDIBits 按 bmi 从指针起直写 w*h*4 字节,缓冲短了就是堆溢出写。
         dst.resize(self.w * self.h * 4, 0);
         unsafe {

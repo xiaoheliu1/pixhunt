@@ -129,7 +129,7 @@ impl Matcher for RgbMatcher {
                 })
                 .collect();
             raw.sort_unstable();
-            dedup(s.tw, s.th, max, raw)
+            dedup(s.vbw, s.vbh, max, raw)
         }
         #[cfg(not(feature = "parallel"))]
         {
@@ -140,18 +140,18 @@ impl Matcher for RgbMatcher {
                 }
             }
             raw.sort_unstable();
-            dedup(s.tw, s.th, max, raw)
+            dedup(s.vbw, s.vbh, max, raw)
         }
     }
 }
 
 /// 去掉重叠的匹配(窗口在 x 或 y 方向重叠即视为同一目标),`raw` 需已按 (y,x) 排序。
-fn dedup(tw: usize, th: usize, max: usize, raw: Vec<(usize, usize)>) -> Vec<Match> {
+fn dedup(w: usize, h: usize, max: usize, raw: Vec<(usize, usize)>) -> Vec<Match> {
     let mut kept: Vec<Match> = Vec::new();
     for (x, y) in raw {
         let conflict = kept
             .iter()
-            .any(|k| (k.x - x as i32).abs() < tw as i32 && (k.y - y as i32).abs() < th as i32);
+            .any(|k| (k.x - x as i32).abs() < w as i32 && (k.y - y as i32).abs() < h as i32);
         if conflict {
             continue;
         }
@@ -189,6 +189,8 @@ struct Scan<'a> {
     thr: i32,
     samples: Vec<Sample>,
     mask: Option<&'a [bool]>,
+    vbw: usize,
+    vbh: usize,
     y_lo: usize,
     y_hi: usize,
     x_lo: usize,
@@ -207,6 +209,30 @@ impl<'a> Scan<'a> {
         }
         let tw3 = tw * 3;
         let mask = tpl.mask.as_deref();
+        // 重叠抑制用的宽/高:有掩码时取**可见像素的外接框**,无掩码(或全被掩掉,
+        // 此时退回旧行为)时等于整张模板尺寸。
+        let (vbw, vbh) = match mask {
+            None => (tw, th),
+            Some(m) => {
+                let (mut x0, mut y0) = (usize::MAX, usize::MAX);
+                let (mut x1, mut y1) = (0usize, 0usize);
+                for y in 0..th {
+                    for x in 0..tw {
+                        if m[y * tw + x] {
+                            x0 = x0.min(x);
+                            y0 = y0.min(y);
+                            x1 = x1.max(x);
+                            y1 = y1.max(y);
+                        }
+                    }
+                }
+                if x0 == usize::MAX {
+                    (tw, th)
+                } else {
+                    (x1 - x0 + 1, y1 - y0 + 1)
+                }
+            }
+        };
         // 采样点:中心 + 四角(内缩以避开边缘抗锯齿),都是模板真实像素 ->
         // "全部通过"是"整窗匹配"的必要条件,故预筛不会漏掉真匹配。
         // 有掩码时只选"未被掩掉"的锚点。
@@ -252,6 +278,8 @@ impl<'a> Scan<'a> {
             thr,
             samples,
             mask,
+            vbw,
+            vbh,
             x_lo: r.x,
             x_hi: r.x + (r.width - tw) + 1,
             y_lo: r.y,
@@ -328,6 +356,45 @@ impl<'a> Scan<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 大模板 + 小可见区:相距 40 px 的两个目标不应被 64 px 的模板外接框吞成一个。
+    #[test]
+    fn find_all_with_mask_dedups_by_visible_box() {
+        let (w, h) = (128usize, 96usize);
+        let (tw, th) = (64usize, 64usize);
+        let s = 16usize;
+        let mut px = vec![0u8; w * h * 4];
+        for (tx, ty) in [(10usize, 10usize), (50usize, 10usize)] {
+            for y in 0..s {
+                for x in 0..s {
+                    let i = ((ty + y) * w + tx + x) * 4;
+                    px[i] = 200;
+                    px[i + 1] = (y * 5 + 2) as u8;
+                    px[i + 2] = (x * 7 + 1) as u8;
+                    px[i + 3] = 255;
+                }
+            }
+        }
+        let frame = Frame::bgra8(w, h, px);
+        let mut rgb = vec![0u8; tw * th * 3];
+        let mut mask = vec![false; tw * th];
+        for y in 0..s {
+            for x in 0..s {
+                let i = (y * tw + x) * 3;
+                rgb[i] = (x * 7 + 1) as u8;
+                rgb[i + 1] = (y * 5 + 2) as u8;
+                rgb[i + 2] = 200;
+                mask[y * tw + x] = true;
+            }
+        }
+        let tpl = Template::from_rgb(rgb, tw, th).with_mask(mask);
+        let got = RgbMatcher::new(0).find_all(&frame, &tpl, frame.full_rect(), 0);
+        assert_eq!(
+            got.len(),
+            2,
+            "可见区只有 16 px,相距 40 px 的两个目标应各自上报"
+        );
+    }
 
     fn gradient(w: usize, h: usize) -> Vec<u8> {
         let mut px = vec![0u8; w * h * 4];
