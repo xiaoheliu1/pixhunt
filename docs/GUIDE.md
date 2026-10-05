@@ -1,6 +1,6 @@
 # pixhunt 使用说明书(从零开始)
 
-> 适用版本:**pixhunt 0.8.0**(2026-10-05 发布)。
+> 适用版本:**pixhunt 0.8.1**(本仓库当前版本;0.8.0 已于 2026-10-05 发布到 crates.io)。
 > 读者假设:**你几乎没写过 Rust**,但你想在自己的屏幕上"找一张图在哪里",然后做点事。
 > 这份说明书覆盖**全部对外 API**、每个参数的含义、能直接复制运行的示例、以及报错怎么排查。
 
@@ -235,15 +235,18 @@ fn main() -> pixhunt::Result<()> {                          // 3
         .build()?;                                          // 9
 
     match finder.find_on_screen(&tpl)? {                    // 10
-        Some(m) => println!("命中!左上角在 ({}, {}),相似度 {}", m.x, m.y, m.score),
+        Some(m) => {
+            let (cx, cy) = m.center(&tpl);                  // 11
+            println!("命中!左上角 ({}, {}),中心 ({}, {})", m.x, m.y, cx, cy);
+        }
         None => println!("屏幕上没找到这张图"),
     }
 
-    // 11:等它出现,最多 10 秒,每 100 毫秒看一次
+    // 12:等它出现,最多 10 秒,每 100 毫秒看一次
     let m = finder.find_until(&tpl, Duration::from_secs(10), Duration::from_millis(100))?;
     println!("等待结果: {:?}", m.map(|m| (m.x, m.y)));
 
-    Ok(())                                                  // 12
+    Ok(())                                                  // 13
 }
 ```
 
@@ -260,9 +263,10 @@ fn main() -> pixhunt::Result<()> {                          // 3
 | 7 | 选截图后端。`Monitor` = 跨平台保底(xcap),不开任何 feature 也能用 |
 | 8 | 选匹配算法。`Rgb { tolerance: 25 }` = 极速 RGB 比对,每通道允许 25 的误差 |
 | 9 | `build()` 可能失败(比如指定了 `Dxgi` 但这机器用不了),所以有 `Result`,要 `?` |
-| 10 | **截一屏 + 找图**。返回 `Option<Match>`:`Some` 是找到,`None` 是没有 |
-| 11 | 轮询等待。命中立刻返回;超时返回 `None`。`.map(...)` 只是把结果里的坐标抽出来好看一点 |
-| 12 | 告诉 main"我正常跑完了" |
+| 10 | **截一屏 + 找图**。返回 `Option<Match>`:`Some` 是找到,`None` 是没有。⚠️ 这里**别打印 `m.score` 当相似度**:`Rgb` 的 score 恒为 `1.0`(见 5.6) |
+| 11 | `m.center(&tpl)` 把左上角换算成**中心坐标**(点击要的是中心) |
+| 12 | 轮询等待。命中立刻返回;超时返回 `None`。`.map(...)` 只是把结果里的坐标抽出来好看一点 |
+| 13 | 告诉 main"我正常跑完了" |
 
 ### 4.4 跑起来
 
@@ -274,7 +278,7 @@ cargo run
 
 ```
 模板尺寸 64x24
-命中!左上角在 (1024, 560),相似度 1
+命中!左上角 (1024, 560),中心 (1056, 572)
 等待结果: Some((1024, 560))
 ```
 
@@ -317,11 +321,11 @@ pixhunt 在比较像素时**自动按帧的格式去取对应的字节**,所以�
 
 - `Match.x` / `Match.y` 是**模板左上角**在屏幕上的位置,**不是中心**。
 - 类型是 `i32`(带符号整数,因为窗口相对截图等场景可能出现负数)。
-- 想点子中心(用来点击):**中心 = 左上角 + 模板尺寸的一半**:
+- 想点子中心(用来点击):`m.center(&tpl)` 算的就是"左上角 + 模板尺寸的一半":
   ```rust
-  let cx = m.x + tpl.width as i32 / 2;
-  let cy = m.y + tpl.height as i32 / 2;
+  let (cx, cy) = m.center(&tpl);
   ```
+  单结果还可以用 `find_center_on_screen`(8.1.11),它返回的 `x`/`y` 已经是中心。
 - 全屏后端(`Monitor`/`Gdi`/`Dxgi`)返回的是**屏幕绝对坐标**;只有 `WindowCapture` 返回的是**相对该窗口客户区左上角**的坐标(见 8.5.5)。
 
 ### 5.4 区域(Rect):只在屏幕上圈一块来找
@@ -335,6 +339,9 @@ pixhunt 在比较像素时**自动按帧的格式去取对应的字节**,所以�
   .region((1200, 800, 700, 400))            // 元组自动转成 Rect
   ```
 - 区域会被**自动夹紧**到屏幕内(超出部分丢掉),所以给个"肯定够大"的矩形不会崩。
+- ⚠️ 但"完全在屏幕之外"不是"够大",而是**坐标写错了**。这种情况下结果永远是"没命中",
+  单看返回值和"屏幕上确实没这张图"完全无法区分。开了 feature `tracing` 之后,库里会
+  在 `warn` 级提示 `region 与抓到的画面完全不相交……`,排查"怎么什么都找不到"时先看它。
 - ⚠️ `Rect` 用的是 `usize`,**表达不了负坐标**。所以副屏(原点带负偏移)上的区域目前只能回退成"截全屏再裁剪"。
 
 ### 5.5 "插座":后端与算法可以各自换
@@ -468,6 +475,7 @@ sudo apt-get install -y --no-install-recommends \
 | 按颜色找色块 | `finder.find_color_on_screen(&spec, min_area)?` | `Result<Vec<ColorBlob>>` |
 | 不截图,在已有帧里找 | `finder.find_in_frame(&frame, &tpl)` | `Option<Match>` |
 | 找到后直接拿中心坐标(免手动加半尺寸) | `finder.find_center_on_screen(&tpl)?` | `Result<Option<Match>>` |
+| 把任一命中换算成中心坐标 | `m.center(&tpl)` | `(i32, i32)` |
 | 判断"这块区域变了没" | `finder.diff_since_last(rect)?` | `Result<u32>` |
 | 改限定区域 | `finder.set_region(Some(Rect::new(..)))` / `set_region(None)` | `()` |
 | 读区域 | `finder.region()` | `Option<Rect>` |
@@ -533,18 +541,40 @@ let hit = finder.find_on_screen(&Template::load("btn.png")?)?;
 
 ⚠️ 每次调用都会**真的截一屏**。在循环里连刷要用 `find_until`(它有缓存优化)。
 
-**缓存跳过机制**:如果后端告诉你"画面自上次以来没变"(目前只有 `DxgiCapture` 会这么报,
-`Monitor`/`Gdi`/`Window` 都保守地报"已变"),且模板和区域都和上次一样,
+**缓存跳过机制**:如果这一帧和上一帧**没有差别**,且模板和区域都和上次一样,
 那就直接复用上次结果、跳过搜索。结果与重新搜一遍**完全一致**,你可以当它不存在。
+
+"画面没变"有两个来源:
+
+- **后端自己上报**:目前只有 `DxgiCapture` 会这么报(桌面复制拿不到新帧),
+  `Monitor`/`Gdi`/`Window` 都保守地报"已变"。
+- **库里自己比**:设了 `region` 且后端支持区域直抓时,库里会把这次抓到的区域和上一帧
+  同尺寸的区域**逐字节比一遍**,相同就按"没变"处理。
+
+⚠️ 第二条是 0.8.1 才有的。此前区域直抓一律被当成"画面变了",于是"`Monitor` 后端 + 限定
+区域反复轮询"这条路径里缓存**一次都没生效过**(实测:静态画面连查 3 次搜 3 次,现在搜
+1 次)。
+
+受影响的只有支持区域直抓的后端:目前只有 `XCapCapture`(`CaptureKind::Monitor`,以及
+`Auto` 回退到它时),且要求该显示器原点在 (0,0)(见 12.5)。`Gdi`/`Dxgi`/`Window` 设了
+`region` 仍然走"抓全屏"路径,`changed` 由后端自己报,`Dxgi` 的静态帧跳过一直是好的。
 
 #### 8.1.4 `find_all_on_screen(&mut self, tpl: &Template, max: usize) -> Result<Vec<Match>>`
 
 截一屏,找出**全部互不重叠**的命中,按 `(y, x)` 升序(从上到下、从左到右)。
 
 - `max`:最多要几个。`max = 0` 表示**不限**。
+- 顺序**保证**是 `(y, x)` 升序:第一个就是最靠上的(同样靠上时最靠左的那个)。
+  `find_color_on_screen` 也是 `(y, x)`(8.1.8),两个多结果 API 现在口径一致。
+  v0.8.0 之前这里写的是 `(y, x)` 但实际按 `x` 优先返回,已经修正。
 - "不重叠"的定义:两个命中如果在 x 方向相差小于模板宽度**且** y 方向相差小于模板高度,
-  就算同一个目标,只留先遇到的那个。所以同一个图标挨着排开不会返回一堆半重叠的假命中。
+  就算同一个目标,只留**先遇到的**那个;按上面的顺序,先遇到的就是**最上、最左**的那个。
   (模板带掩码时,这里的宽高取**可见区**的外接框而非整张模板,见 8.4.3。)
+- ⚠️ **平坦画面 + `max = 0` 会返回海量命中**。纯色背景上放一张纯色小模板,屏幕上**每个位置**
+  都是命中:1920x1200 纯色帧 + 8x8 模板实测返回 **36000** 个,串行 ~347ms(开 `parallel`
+  ~151ms)。给个真实上限(比如 20)能提前停止扫描:同场景 `max = 1` 实测 ~0.28ms。
+  去重本身已是按行增量做的(不再是"每个候选和全部结果比一遍"的二次方),但命中数量本身
+  还是由屏幕有多平坦决定——真正的解法是别从纯色区裁模板(见 8.6.1)。
 - ⚠️ **用 `CorrMatcher` 时它只返回 1 个**。原因:`find_all` 在 `Matcher` trait 里有个基于
   裁剪的默认实现,只转发单个 `find`;`RgbMatcher` 覆写了它,`CorrMatcher` 没有(见 8.6.1)。
   要"多目标 + 抗光照"目前得自己移动 `region` 分次找。
@@ -576,11 +606,18 @@ if rs[0].is_some() { println!("当前在主页"); }
 
 - 命中不算超时:哪怕只剩 1 毫秒,查到就返回 `Some`。
 - `interval` 不会被睡过头:最后一轮会取 `min(interval, 剩余时间)`。
-- 等待期间每轮都是真截图。想省 CPU:用 `Dxgi` 后端(静态画面会被跳过),或把 `interval` 设大点。
+- 想"一直等下去"可以直接传 `Duration::MAX`(或 `from_secs(u64::MAX)`):库里用
+  `checked_add` 算截止时刻,算不出来就当**永不超时**,不会 panic。v0.8.0 之前这里会
+  在 `Instant::now() + timeout` 溢出时当场 panic。
+- 等待期间每轮都会截图,但**画面没变就不会重新搜索**(见 8.1.3 的缓存跳过):
+  `Dxgi` 后端自己上报,或者你设了 `region` 且后端支持区域直抓时库里逐字节比对。
+  其余情况(静态画面 + `Monitor`/`Gdi`/`Window` + 全屏)每轮都是真截图 + 真搜索,
+  想省 CPU 就把 `interval` 设大点。
 
 ```rust
 use std::time::Duration;
 let m = finder.find_until(&tpl, Duration::from_secs(10), Duration::from_millis(80))?;
+let m = finder.find_until(&tpl, Duration::MAX, Duration::from_millis(200))?; // 一直等
 ```
 
 #### 8.1.7 `wait_gone(&mut self, tpl: &Template, timeout: Duration, interval: Duration) -> Result<bool>`
@@ -590,6 +627,7 @@ let m = finder.find_until(&tpl, Duration::from_secs(10), Duration::from_millis(8
 - `Ok(true)`:在 `timeout` 内确实找不到了(等待成功)。
 - `Ok(false)`:到时间了还在(比如加载遮罩一直转)。
 - 语义与 `find_until` 相反,注意别搞混:**它返回 `bool` 而不是 `Option<Match>`**。
+- 超时参数同样允许 `Duration::MAX`(视为永不超时,不会 panic),缓存/轮询行为见 8.1.6。
 
 典型用途:等"正在保存…"的提示条不见了再继续下一步。
 
@@ -624,7 +662,8 @@ let hit = finder.find_in_frame(&frame, &tpl);   // 之后匹配多少个模板�
 
 运行中改 / 读限定区域。`None` = 整屏。
 
-`set_region` 会**作废内部的结果缓存**(否则换个区域还返回上一个区域的旧结果就错了)。
+`set_region` 会**作废内部的结果缓存**(否则换个区域还返回上一个区域的旧结果就错了),
+同时重置"区域越界"的告警状态——新区域如果又跑到屏幕外,还会再 warn 一次(见 5.4)。
 
 ```rust
 finder.set_region(Some(Rect::new(1200, 800, 700, 400)));  // 只看右下角一块
@@ -642,6 +681,9 @@ if let Some(m) = finder.find_center_on_screen(&tpl)? {
     println!("点击 ({}, {})", m.x, m.y);
 }
 ```
+
+⚠️ 它只对**单结果**有效。`find_all_on_screen` / `find_many_on_screen` 返回的仍是左上角,
+要中心坐标请用 `m.center(&tpl)`(8.4.5),别自己写 `m.x + tpl.width as i32 / 2`。
 
 #### 8.1.12 `diff_since_last(&mut self, rect: Rect) -> Result<u32>`
 
@@ -746,6 +788,10 @@ pub enum MatchKind {
   换来的是 `score` 真的是相似度分数。
 - ⚠️ `Corr` 工作在**灰度**上:纯色/零方差模板(比如一整块纯红)在它眼里"没有对比度",
   匹配不到属预期。这种场景该用颜色搜索(8.8)。
+- ⚠️ `Corr` **不认模板掩码**:`Template::load` 会把 PNG 里 `alpha == 0` 的像素做成掩码,
+  `Rgb` 比较时跳过它们,而 `Corr` 走的是整块灰度相关、拿不到掩码接口。透明区转灰度后
+  通常是**黑色**,于是那块黑被当成目标内容一起打分 —— 同一张 PNG,`Rgb` 能命中、`Corr`
+  可能命不中。带透明区的模板请配 `Rgb`(详见 8.4.3)。
 
 #### 8.2.4 默认值(不用猜)
 
@@ -888,12 +934,18 @@ pub fn with_mask(self, mask: Vec<bool>) -> Self   // builder-style
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Match { pub x: i32, pub y: i32, pub score: f32 }
+
+impl Match {
+    pub fn center(&self, tpl: &Template) -> (i32, i32);   // 左上角 + 半尺寸
+}
 ```
 
 - `x` / `y`:**模板左上角**位置。全屏后端 = 屏幕绝对坐标;`WindowCapture` = 窗口相对。
-- `score`:`Rgb` 恒为 `1.0`;`Corr` 是 ZNCC 分数(`0.0..=1.0`,越大越像)。
+- `score`:`Rgb` 恒为 `1.0`(它是/否判定,没有百分比);`Corr` 是 ZNCC 分数(`0.0..=1.0`,越大越像)。
+  别拿 `Rgb` 的 1.0 去排序"哪个最像"。
 - 是 `Copy` 类型,赋值/传参都是复制,不必纠结借用。
-- 中心点:`m.x + tpl.width as i32 / 2`(见 9.1)。
+- `center(&tpl)`:返回**中心坐标** `(x + tpl.width/2, y + tpl.height/2)`。`find_all` 这类
+  多结果要点击中心时用它,不用自己折算(单结果有 `find_center_on_screen`,见 8.1.11)。
 
 ### 8.5 截图后端:`Capture` trait 与四个实现
 
@@ -1115,7 +1167,10 @@ impl RgbMatcher { pub fn new(tolerance: i32) -> Self }
   早失败也失效——1080p + 64px 模板实测会从 ~3ms 退化到 **~1.9 秒**。
   避免办法:模板不要从纯色区裁;真要纯色请用颜色搜索(8.8)或 `Corr`(但它也怕零方差)。
 
-`find_all` 的去重规则见 8.1.4。
+`find_all` 的去重规则见 8.1.4。它按 `(y, x)` 顺序扫描,并对每一行**增量**判断"这个候选
+是否已被更早保留的命中盖住"(只与 y 方向相差小于模板高度的那些保留项冲突,配一个滑动的
+窗口和每列覆盖计数)。所以去重成本是 `O(候选数 + 保留数 × 模板宽)`,不是旧版的
+`O(候选数 × 保留数)` —— 平坦画面上旧版会跑几十秒,新版只剩扫描本身的时间。
 
 ### 8.7 `CorrMatcher` 与 `CorrConfig` 〔f:match-corr〕
 
@@ -1331,9 +1386,8 @@ fn main() -> pixhunt::Result<()> {
         return Ok(());
     };
 
-    // 手:匹配坐标是模板左上角,加半个模板尺寸才是中心
-    let cx = m.x + tpl.width as i32 / 2;
-    let cy = m.y + tpl.height as i32 / 2;
+    // 手:匹配坐标是模板左上角,center() 帮你加上半个模板尺寸
+    let (cx, cy) = m.center(&tpl);
     println!("命中 @ ({}, {}),点击中心 ({}, {})", m.x, m.y, cx, cy);
 
     let mut enigo = Enigo::new(&Settings::default())
@@ -1562,7 +1616,15 @@ mod tests {
 | --- | --- | --- |
 | `Rgb` 单目标全屏 | ~2.95ms | **~1.68ms** |
 | `Rgb` 多目标 `find_all` | ~4.52ms | **~1.20ms** |
+| `Rgb` `find_all` **纯色帧** + 8x8 纯色模板(1080p,32400 命中,`max=0`) | ~485ms | **~141ms** |
+| 同上但 `max=1`(命中即停) | ~0.43ms | ~2.2ms |
 | `Corr`(ZNCC)单目标 | ~13.7ms | **~6.6ms** |
+
+纯匹配这几行来自 `cargo bench --bench match`(1920x1080 合成帧)。`cargo bench --bench match -- find_all`
+里有 `rgb_find_all_flat_1080p_max1` / `..._unlimited` 两条守着平坦画面的基准。
+作为对照,v0.8.0 及之前在 **1920x1200** 纯色帧 + 8x8 纯色模板(36000 命中)上实测:
+`max=0` 要 **~23.5 秒**、`max=1` 也要 ~471ms(去重是二次方,且 `max` 只截断结果长度、
+不减少工作量);同一场景现在是串行 ~347ms / parallel ~151ms,`max=1` ~0.28ms。
 
 **端到端(截图 + 匹配)**
 
@@ -1577,7 +1639,8 @@ mod tests {
 - **截图占 90% 以上**。想让找图快,先动后端和区域,别优化算法。
 - Windows 上把 `CaptureKind::Monitor` 换成 `Dxgi` 或 `Auto`,几乎白捡一半时间。
 - **限定区域**是第二根杠杆(47ms → 20ms),因为你只截/只扫一小块。
-- 静态桌面轮询:只有 `Dxgi` 会报"画面没变"并跳过搜索,`Monitor`/`Gdi` 每轮都真截图。
+- 静态桌面轮询:后端不上报"没变"时(`Monitor`/`Gdi`/`Window`),**设了 `region` 就会由库里
+  逐字节比对区域帧**来跳过重复搜索;全屏轮询则只有 `Dxgi` 能跳过(见 8.1.3)。
 - `parallel` 大约给匹配 1.7~2x(算法本身不变,结果完全一致)。ZNCC 提速更明显(约 2x)。
 
 ### 10.3 什么会让它突然变慢(重要)
@@ -1585,13 +1648,23 @@ mod tests {
 | 现象 | 原因 | 办法 |
 | --- | --- | --- |
 | `Rgb` 从 ~3ms 掉到 **秒级** | 模板**和**搜索区域都近乎单色:锚点筛不掉、逐像素早失败失效 | 模板别从纯色区裁;换颜色搜索;或给足纹理 |
+| `find_all` 在平坦画面上返回几万个命中 | 纯色背景上**每个位置**都算命中,`max=0` 就是全要 | 给 `max` 一个具体数字(实测同一场景 `max=1` 比 `max=0` 快 1000 倍以上);或缩小 `region`;见 8.1.4 |
 | 以为"每帧重新分配缓冲"是瓶颈 | 实测 Windows 上大块 `alloc`+`free` 只有 **~0.006ms**,而 9MB 像素的 `memcpy` 要 **~0.8ms** | 别在这上面动手:让 `XCapCapture` 复用缓冲是**负收益**(多的那次拷贝远大于省下的分配)。要快就换 `Dxgi`(截图本身省 15ms+) |
 | 区域设了却没变快 | 在副屏上(原点非 (0,0))会回退全屏 | 见 9.5;或直接 `crop` 后调 `find_in_frame` |
 | `Corr` 慢得离谱 | 金字塔层数全开 + 大 ROI | 按 8.7.1 调 `max_image_levels` / `roi_radius` |
 
 ### 10.4 release 构建很重要
 
-调试构建(`cargo run` 默认)会慢好几倍。性能相关一律加 `--release`:
+**本说明书与 README 里所有性能数字都是 `--release` 实测**;调试构建会慢一个数量级,
+拿 debug 的耗时去判断"库快不快"没有意义。同一台机器上跑同一份合成场景
+(1920x1080 有纹理帧 + 64px 模板,`RgbMatcher`,纯匹配不含截图):
+
+| 场景 | `cargo run`(debug) | `cargo run --release` |
+| --- | --- | --- |
+| 全屏 miss(扫满每一行) | ~60.1ms | ~4.0ms |
+| 全屏命中 | ~23.4ms | ~1.5ms |
+
+性能相关一律加 `--release`:
 
 ```powershell
 cargo run --release --example find_on_screen -- D:\pic\button.png
@@ -1749,8 +1822,12 @@ rustc --version        # 确认 ≥ 1.88
 
 ### 11.10 在线文档(docs.rs)打不开或显示构建失败
 
-这不是本 crate 的代码问题:它要构建 `xcap`,而 `xcap` 的构建脚本需要系统库(libclang、
-PipeWire 头文件等),docs.rs 环境没有。本地看文档没问题:
+这不是本 crate 的代码问题:**已核实 `pixhunt-0.8.0` 在 docs.rs 的构建状态就是 failed**
+(去 crate 页面的 "Builds" 看)。它要构建 `xcap`,而 `xcap` 的构建脚本需要系统库(libclang、
+PipeWire 头文件等),docs.rs 环境没有。
+
+连带后果:整份在线文档都出不来,`CaptureKind::Gdi` / `Dxgi` / `Window` / `Auto` 这些
+`#[cfg(windows)]` 变体自然也不会在 docs.rs 上出现 —— 别以为"库里没这个功能"。看本地文档:
 
 ```powershell
 cargo doc --no-deps --open
@@ -1783,7 +1860,7 @@ Template                                        —— template.rs
 Template:字段 rgb/width/height/mask;load, from_rgb, from_rgba, with_mask, content_key, to_gray
 
 Match, Matcher, RgbMatcher                      —— matcher.rs
-Match:字段 x(i32)/y(i32)/score(f32)
+Match:字段 x(i32)/y(i32)/score(f32);center(&tpl) → (i32, i32)
 Matcher:find, find_in, find_all
 RgbMatcher:字段 tolerance(i32);new
 
@@ -1818,7 +1895,8 @@ Result<T> = std::result::Result<T, Error>
 〔match-corr〕    CorrMatcher::new() / with_config(CorrConfig) / Default
                   CorrConfig{max_image_levels, beam_width, roi_radius, min_score, parallel}
                   MatchKind::Corr / MatchKind::CorrWith(CorrConfig)
-〔tracing〕       库内部发出 target="pixhunt" 的 trace 事件(需要你自己装 subscriber)
+〔tracing〕       库内部发出 target="pixhunt" 的 trace 诊断事件 + 一条 region 越界的 warn
+                  (需要你自己装 subscriber)
 〔parallel〕      RgbMatcher 按行并行;给 corrmatch 传导 rayon 能力
 ```
 
@@ -1851,10 +1929,13 @@ pixhunt::template   Template
 
 | 后端 | 格式 | 命中坐标 | `grab_region` | `grab_into` 返回 `false` |
 | --- | --- | --- | --- | --- |
-| `XCapCapture` | RGBA | 屏幕绝对 | ✅(仅原点 (0,0)) | ❌ 恒 `true` |
+| `XCapCapture` | RGBA | 屏幕绝对 | ✅(仅原点 (0,0)) | ❌ 恒 `true`¹ |
 | `GdiCapture` | BGRA | 屏幕绝对 | ❌ | ❌ 恒 `true` |
 | `DxgiCapture` | BGRA | 屏幕绝对 | ❌ | ✅ 会报没变 |
 | `WindowCapture` | BGRA | **窗口客户区相对** | ❌ | ❌ 恒 `true` |
+
+¹ `XCapCapture` 自己不会报"没变",但**设了 `region` 走区域直抓时**,`Finder` 会把这次
+的区域和上一帧逐字节比对来补齐这个信息(0.8.1 起);全屏路径无人代劳,每轮都算"变了"。
 
 ### 12.6 仓库自带的三个示例
 
@@ -1888,22 +1969,23 @@ pixhunt::template   Template
 | **`Option<T>` / `Result<T, E>`** | "可能有/没有" / "可能成功/失败"。Rust 用它代替 null 和异常 |
 | **`?`** | 出错就提前返回错误,成功就继续。只能用在返回 `Result`/`Option` 的函数里 |
 | **`&mut self`** | 该方法会改动调用者所属的对象,所以变量要 `mut` |
-| **panic** | 程序遇到无法继续的硬错误直接中止。本库只在用 `Template::from_rgb` / `from_rgba` / `with_mask` 传的字节长度与尺寸不符时 panic(见 8.4.3);截图失败、找不到模板一律走 `Err` / `Ok(None)`,不会 panic |
+| **panic** | 程序遇到无法继续的硬错误直接中止。本库只在用 `Template::from_rgb` / `from_rgba` / `with_mask` 传的字节长度与尺寸不符时 panic(见 8.4.3);截图失败、找不到模板、传超大超时(`Duration::MAX`)一律走 `Err` / `Ok(None)` / 永不超时,不会 panic |
 
 ---
 
-## 版本迁移备忘(升到 0.8 前要知道的)
+## 版本迁移备忘(升到 0.8.1 前要知道的)
 
 | 从 | 到 | 破坏性变更 |
 | --- | --- | --- |
 | v0.5 | v0.6 | 默认后端从 `screenshots` 换成 `xcap`:`CaptureKind::Screenshots` → `Monitor`;`ScreenshotsCapture` → `XCapCapture`;MSRV 1.75 → **1.88**(开 `match-corr` 需 1.89);限定区域改为优先"直接区域抓取" |
 | v0.6 | v0.7 | `Error::Capture(String)` → `Error::Capture { message, source }`;新增 `Error::capture` / `Error::capture_from`;只做 `to_string()` 的代码输出不变 |
 | v0.7 | v0.8 | `Template` 新增 `pub mask: Option<Vec<bool>>` 字段——用字面量构造 `Template { rgb, width, height }` 的代码需加 `mask: None`;推荐走工厂方法(`load`/`from_rgb`/`from_rgba`)则无需改动。新增 `find_center_on_screen`、`diff_since_last`、`CaptureKind::WindowByTitle`;`Template::load` 现支持 JPEG/WebP |
+| v0.8.0 | v0.8.1 | **无破坏性变更**(只新增 `Match::center`)。但有四处**行为修正**要留意:① `find_all` 的返回顺序从"按 x 优先"改成文档承诺的 `(y, x)` 升序,重叠去重保留的也从"最左"变成"最上最左";② `find_all` 的去重从二次方降为按行增量,`max` 现在会提前停止扫描(平坦画面(1920x1200)从 ~23.5s 回到 ~0.35s);③ `XCapCapture` + `region` 时静态帧缓存开始生效(画面没变就复用上次结果,结果与重搜一致);④ `find_until` / `wait_gone` 传 `Duration::MAX` 不再 panic,改为永不超时 |
 
 ## 许可
 
 MIT OR Apache-2.0。
 
-> 本说明书内容由 AI 编码助手依据 **pixhunt 0.8.0 的实际源码**逐个 API 清点后撰写,
+> 本说明书内容由 AI 编码助手依据 **pixhunt 0.8.1 的实际源码**逐个 API 清点后撰写,
 > 不保证逐行经过人工细读。若你升级了版本,请以 `cargo doc --no-deps --open` 生成的
 > 最新文档和源码为准。

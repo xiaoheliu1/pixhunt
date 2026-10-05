@@ -8,7 +8,8 @@
 > 纯 Rust,无需 OpenCV。适合自动化测试、脚本辅助、UI 定位等。
 
 ## 它做什么
-给一张小图 `template.png`,`pixhunt` 告诉你在当前屏幕的哪个位置、有多像:
+给一张小图 `template.png`,`pixhunt` 告诉你在当前屏幕的哪个位置(用 `Corr` 时还给一个
+相似度分数):
 
 ```rust
 use pixhunt::{Finder, CaptureKind, MatchKind, Template};
@@ -20,7 +21,10 @@ let mut finder = Finder::builder()
     .build()?;
 
 if let Some(m) = finder.find_on_screen(&tpl)? {
-    println!("在 ({}, {}), 相似度 {}", m.x, m.y, m.score);
+    // 注意:`Rgb` 是"容差内逐像素全对才算命中"的判定,它的 m.score 恒为 1.0;
+    // 想要真正的相似度分数(0.0..=1.0)请用 MatchKind::Corr。
+    let (cx, cy) = m.center(&tpl); // 要点击的是中心,不是左上角
+    println!("命中 @ ({}, {}),中心 ({}, {})", m.x, m.y, cx, cy);
 }
 ```
 
@@ -89,8 +93,14 @@ let finder = Finder::builder()
     .region(Rect::new(100, 80, 640, 480))
     .build()?;
 
-// 2) 多结果:找全部不重叠匹配(重叠自动去重),max=0 表示不限
-let all = finder.find_all_on_screen(&tpl, 0)?;
+// 2) 多结果:找全部不重叠匹配(重叠自动去重),按 (y, x) 升序;max=0 表示不限。
+//    ⚠️ 平坦画面(纯色背景 + 纯色小模板)上"每个位置都是命中",别随手写 0:
+//    1920x1200 纯色帧 + 8x8 纯色模板实测返回 36000 个。给个真实上限(比如 20)能提前停止扫描。
+let all = finder.find_all_on_screen(&tpl, 20)?;
+for m in &all {
+    let (cx, cy) = m.center(&tpl); // 多结果要点中心时用它,不用自己折算
+    println!("命中 @ ({}, {}) → 点击 ({cx}, {cy})", m.x, m.y);
+}
 
 // 3) 批量:只截一屏,一次匹配多张模板(省掉重复截图)
 let hits = finder.find_many_on_screen(&[&tpl_a, &tpl_b, &tpl_c])?;
@@ -107,7 +117,8 @@ use std::time::Duration;
 use pixhunt::{Finder, CaptureKind, MatchKind, Template, WindowCapture};
 
 // 4) 轮询等待:等按钮出现(命中即返回,超时返回 None);等遮罩消失同理。
-//    配合 DXGI 后端的"静态帧跳过",等待期间几乎零开销。
+//    timeout 可以传 Duration::MAX(永不超时,不会 panic)。
+//    静态画面会被跳过搜索:DXGI 后端自己上报,或设了 region 时由库里逐字节比对区域帧。
 let m = finder.find_until(&tpl, Duration::from_secs(10), Duration::from_millis(50))?;
 let gone = finder.wait_gone(&loading_tpl, Duration::from_secs(30), Duration::from_millis(100))?;
 
@@ -125,7 +136,8 @@ pixhunt 专注做**眼睛**(截图 + 定位),不做"手"——点击/输入交�
 
 ```rust,ignore
 let m = finder.find_until(&button, Duration::from_secs(10), Duration::from_millis(80))?.unwrap();
-enigo.move_mouse(m.x + button.width as i32 / 2, m.y + button.height as i32 / 2, Coordinate::Abs)?;
+let (cx, cy) = m.center(&button); // 匹配坐标是左上角,center() 折算成点击的中心
+enigo.move_mouse(cx, cy, Coordinate::Abs)?;
 enigo.button(Button::Left, Direction::Click)?;
 ```
 
@@ -154,6 +166,15 @@ finder.find_on_screen(&tpl)?; // trace: op="find_on_screen" backend="dxgi" chang
 ```
 
 ## 性能(参考)
+
+> ⚠️ **下面所有数字都是 `--release` 构建实测。** debug 构建(`cargo run` / `cargo build`
+> 默认)慢一个数量级:同一台机器、同一份 1920x1080 合成场景,全屏扫一遍
+> debug ~60ms / release ~4ms。别拿 debug 的耗时评价这个库。
+>
+> 另:`Cargo.toml` 里的 `[profile.release]`(`lto`、`codegen-units = 1`)**只对在本仓库里
+> 跑示例/基准生效**。你依赖 pixhunt 时,优化级别由你自己项目的 `[profile.release]` 决定
+> ——想吃到同样性能,请在你项目根 `Cargo.toml` 里也写上这三行(见 `docs/GUIDE.md` 10.4)。
+
 同一台 8 逻辑核机器、`--release` 实测。截图为 1920x1200 真实桌面的连续取帧中位数,
 纯匹配为 `cargo bench --bench match`(1920x1080 合成帧 + 64px 模板):
 
@@ -220,6 +241,34 @@ let m = finder.find_on_screen(&Template::load("btn.png")?)?;
   同名字段是**逐金字塔层**的候选门槛,而粗筛层分数天然偏低,拿它当最终阈值会把真命中
   整条链路削空。
 
+## v0.8.1 变更
+
+修订号级别:没有破坏性改动(只新增一个方法),但有四处**行为修正**,升级后结果可能和 0.8.0 不同:
+
+- **`find_all` 的返回顺序改成文档承诺的 `(y, x)` 升序**(从上到下、从左到右)。此前实际按
+  `x` 优先排,且重叠去重"留先遇到的那个"因此留下的是**最左**而非**最上**的命中。现在与
+  `find_color_on_screen` 口径一致。依赖旧顺序的代码需要复核。
+- **`find_all` 的去重从二次方改为按行增量,`max` 现在真的限制工作量**。此前 `max` 只截断
+  结果长度、扫描和去重照样跑完全程:1920x1200 纯色帧 + 8x8 纯色模板、`max=0`(36000 命中)
+  实测 **23.5 秒**,`max=1` 也要 ~471ms;同一场景现在 **串行 ~347ms / 开 `parallel` ~151ms**,
+  `max=1` 降到 **~0.28ms**(parallel ~2.7ms,并行按行块扫描、块内至少扫完一整块)。
+  `max` 给 0 的旧代码不会变错,只是从"卡住半小时"变成能跑完。
+- **设了 `region` 且后端支持区域直抓(目前只有 `XCapCapture`)时,静态帧缓存开始生效**。
+  此前这条路径把每帧都当"画面变了",于是"盯着一小块反复轮询"时缓存 100% 失效(实测静态
+  画面连查 3 次搜 3 次,现在搜 1 次)。复用结果与重新搜一遍**完全一致**。`Gdi`/`Dxgi`/
+  `Window` 走全屏路径,`changed` 由后端自己报,不受影响。
+- **`find_until` / `wait_gone` 传 `Duration::MAX` 不再 panic**。此前 `Instant::now() + timeout`
+  溢出会当场中止进程;现在算不出截止时刻就当永不超时。
+
+新增:
+
+- **`Match::center(&tpl) -> (i32, i32)`**:把命中换算成中心坐标。`find_center_on_screen`
+  只覆盖单结果,`find_all` / `find_many` 的结果此前要自己写 `m.x + tpl.width as i32 / 2`。
+- **`region` 完全落在画面外时提示一次**:`tracing` feature 开启后输出 `warn`(未改动返回值,
+  仍是 `Ok(None)`),用来区分"region 坐标写错了"和"屏幕上确实没这张图"。
+- **文档口径**:README/`Match` 字段注释都写明 `Rgb` 的 `score` 恒为 `1.0`(此前只有说明书
+  里有);`MatchKind::Corr` 侧补上"ZNCC 走灰度、不认模板掩码"的提醒。
+
 ## v0.8 新功能
 
 - **透明掩码模板**:`Template::load` 自动识别 PNG alpha;新增 `Template::from_rgba` / `with_mask`;`RgbMatcher` 比较时跳过掩码像素。
@@ -285,9 +334,11 @@ cargo run --release --features capture-dxgi,capture-gdi --example find_on_screen
 
 ## 注意
 - **分辨率 / DPI**:模板与截图需同一分辨率尺度,否则找不到。
-- **文档**:`cargo doc --no-deps --open` 看完整 API 注释。docs.rs 上本 crate 可能构建
-  失败 —— 因为依赖 xcap 的构建脚本需要系统库(libclang / PipeWire headers),
-  docs.rs 环境没有这些包,不是本 crate 的代码问题。
+- **文档**:`cargo doc --no-deps --open` 看完整 API 注释。**docs.rs 上本 crate 的构建目前是
+  失败的**(`pixhunt-0.8.0` 在 docs.rs 的 builds 页显示 failed):原因是要编译依赖 `xcap`,
+  而 `xcap` 的构建脚本需要系统库(libclang / PipeWire headers 等),docs.rs 环境没有这些包,
+  不是本 crate 的代码问题。连带后果:在线文档里看不到 `CaptureKind::Gdi` / `Dxgi` /
+  `Window` / `Auto` 这些 Windows 专有变体 —— 想查这些请直接看本地文档或源码。
 - **截图 ≠ 匹配**:两者是分开计时/分开的步骤,别把截图耗时算进算法。
 - **DXGI 限制**:RDP / 锁屏 / 无 GPU 时不可用,`CaptureKind::Auto` 会自动回退。
 - **Linux 系统依赖**:默认后端 xcap 在 X11 走 xcb、Wayland 走 PipeWire/Wayland,
@@ -302,6 +353,8 @@ cargo run --release --features capture-dxgi,capture-gdi --example find_on_screen
 - **平坦内容会让 `Rgb` 退化**:当模板与搜索区域**都**近乎单色(相邻像素几乎没有差异)
   时,锚点与逐像素早失败全部失效,扫描退化为暴力全量。1080p + 64px 实测:有纹理
   ~3ms,零方差模板放在纯色背景上 ~1.9s(慢 600 倍),且平坦区里会有多个"等价"命中点。
+  `find_all` 在这种画面上还会返回**海量命中**(1920x1200 纯色帧 + 8x8 模板实测 36000 个),
+  所以 `max` 请给真实上限,别习惯性写 0。
   裁模板请选**有边缘、有纹理**的区域,别从纯色背景上切一块。
 
 ## 说明:内容由 AI 生成

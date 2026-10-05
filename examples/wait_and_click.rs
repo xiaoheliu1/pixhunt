@@ -32,8 +32,7 @@ fn main() -> pixhunt::Result<()> {
 
     // 2) 手:enigo 移动 + 左键点击模板中心。pixhunt 与键鼠解耦,坐标即接口。
     //    键鼠库自己的错误用 `capture_from` 挂在 source 上,别只留一句字符串。
-    let cx = m.x + tpl.width as i32 / 2;
-    let cy = m.y + tpl.height as i32 / 2;
+    let (cx, cy) = m.center(&tpl);
     println!("命中 @ ({}, {}),点击中心 ({cx}, {cy})", m.x, m.y);
     let mut enigo = Enigo::new(&Settings::default())
         .map_err(|e| pixhunt::Error::capture_from("enigo init failed", e))?;

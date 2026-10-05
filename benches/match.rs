@@ -113,6 +113,24 @@ fn bench_find_all(c: &mut Criterion) {
     });
 }
 
+/// 最坏情况:纯色帧 + 纯色小模板 —— 每个位置都是候选,1080p 下命中上万个。
+/// 旧的去重是"每个候选和全部已保留结果比一遍"(二次方,实测 23.5 s),按行增量
+/// 去重之后应回落到"与扫描本身同量级"。这两条基准专门守"平坦画面把用户卡死"的回归,
+/// 也守住 `max` 是否真的限制工作量(而不是只截断结果长度)。
+fn bench_find_all_flat(c: &mut Criterion) {
+    let (w, h) = (1920usize, 1080usize);
+    let frame = Frame::bgra8(w, h, vec![70u8; w * h * 4]);
+    let tpl = Template::from_rgb(vec![70u8; 8 * 8 * 3], 8, 8);
+    let m = RgbMatcher::new(0);
+    let region = frame.full_rect();
+    c.bench_function("rgb_find_all_flat_1080p_max1", |b| {
+        b.iter(|| m.find_all(black_box(&frame), black_box(&tpl), black_box(region), 1))
+    });
+    c.bench_function("rgb_find_all_flat_1080p_unlimited", |b| {
+        b.iter(|| m.find_all(black_box(&frame), black_box(&tpl), black_box(region), 0))
+    });
+}
+
 /// 有纹理的 1080p 帧 + 贴在 (tx,ty) 的 `s`px 模板(供 ZNCC 使用,需局部对比度)。
 #[cfg(feature = "match-corr")]
 fn textured_scene(s: usize) -> (Frame, Template) {
@@ -171,6 +189,7 @@ criterion_group!(
     bench_find,
     bench_find_masked,
     bench_find_all,
+    bench_find_all_flat,
     bench_diff_since_last,
     bench_corr
 );
@@ -180,6 +199,7 @@ criterion_group!(
     bench_find,
     bench_find_masked,
     bench_find_all,
+    bench_find_all_flat,
     bench_diff_since_last
 );
 

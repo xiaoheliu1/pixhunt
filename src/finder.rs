@@ -41,11 +41,21 @@ pub enum CaptureKind {
 /// 可选的匹配算法。
 pub enum MatchKind {
     /// 极速 RGB 比对。`tolerance` 为每通道最大绝对差(0=精确,~25≈容差 0.1)。
+    ///
+    /// 命中结果的 `score` 恒为 `1.0`(通过/不通过判定),要相似度分数请用
+    /// `MatchKind::Corr`(需 feature `match-corr`)。
     Rgb { tolerance: i32 },
     /// 基于 corrmatch 的 ZNCC(灰度,抗光照/轻微缩放变化)。需 feature `match-corr`。
+    ///
+    /// ⚠️ ZNCC 走的是 [`Template::to_gray`],那条路径**没有掩码接口**:`Template::load`
+    /// 从 PNG alpha 自动做出来的掩码在这里不生效,透明区会连同其 RGB(灰度下通常是黑)
+    /// 一起当成目标内容参与打分。同一张 PNG 可能 `Rgb` 命中而 `Corr` 落空——带透明的
+    /// 模板请继续用 [`MatchKind::Rgb`]。
     #[cfg(feature = "match-corr")]
     Corr,
     /// 同上,但自定义搜索参数(金字塔层数/ROI/阈值/并行)。需 feature `match-corr`。
+    ///
+    /// 同样**不使用掩码**,见 [`MatchKind::Corr`] 的说明。
     #[cfg(feature = "match-corr")]
     CorrWith(CorrConfig),
 }
@@ -59,6 +69,8 @@ pub struct Finder {
     prev_frame: Option<Frame>,
     cache_key: Option<u64>,
     cache_result: Option<Option<Match>>,
+    /// region 与画面不相交是否已经 warn 过(避免轮询刷屏)。
+    region_offscreen_warned: bool,
 }
 
 impl Finder {
@@ -80,6 +92,7 @@ impl Finder {
             prev_frame: None,
             cache_key: None,
             cache_result: None,
+            region_offscreen_warned: false,
         }
     }
 
@@ -87,6 +100,11 @@ impl Finder {
     ///
     /// 当后端报告画面自上次以来**未变化**、且模板与区域都和上次相同,则直接复用
     /// 上次结果、跳过搜索(静态桌面轮询的常见加速;结果与重新搜一遍完全一致)。
+    /// 未变化有两种来源:后端自己报(DXGI 的 `WAIT_TIMEOUT`),以及设了 `region` 且
+    /// 区域直抓([`Capture::grab_region`])到的帧与上一帧逐字节相同。
+    ///
+    /// 命中时 `Match::score` 的口径随匹配器不同:`MatchKind::Rgb` 恒为 `1.0`,只有
+    /// `Corr`(ZNCC,需 feature `match-corr`)的分数才表示"有多像"。
     pub fn find_on_screen(&mut self, tpl: &Template) -> Result<Option<Match>> {
         let _t0 = px_timer!();
         let (changed, origin) = self.grab_scoped()?;
@@ -153,53 +171,78 @@ impl Finder {
     }
 
     /// 轮询等待模板**出现**:每 `interval` 查一次,命中立即返回;超过 `timeout`
-    /// 仍未出现返回 `Ok(None)`。自动化脚本"等按钮出现"的标准姿势,配合后端
-    /// 的静态帧跳过,等待期间开销极小。
+    /// 仍未出现返回 `Ok(None)`。自动化脚本"等按钮出现"的标准姿势,配合后端的
+    /// 静态帧跳过(以及区域直抓时的帧比对),等待期间开销极小。
+    ///
+    /// `timeout` 大到没法加进当前时刻(典型入参 `Duration::MAX`)时视为**永不超时**,
+    /// 不会 panic。
     pub fn find_until(
         &mut self,
         tpl: &Template,
         timeout: Duration,
         interval: Duration,
     ) -> Result<Option<Match>> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(m) = self.find_on_screen(tpl)? {
-                px_trace!(op = "find_until", result = "hit", timeout = ?timeout);
-                return Ok(Some(m));
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                px_trace!(op = "find_until", result = "timeout", timeout = ?timeout);
-                return Ok(None);
-            }
-            std::thread::sleep(interval.min(deadline - now));
-        }
+        let m = self.poll(tpl, timeout, interval, true)?;
+        px_trace!(
+            op = "find_until",
+            result = if m.is_some() { "hit" } else { "timeout" },
+            timeout = ?timeout,
+        );
+        Ok(m)
     }
 
     /// 轮询等待模板**消失**:在 `timeout` 内找不到即返回 `Ok(true)`,超时仍能找到
     /// 返回 `Ok(false)`(如等加载遮罩消失、等按钮置灰图标下屏)。
+    ///
+    /// 同 [`Finder::find_until`]:超大的 `timeout`(如 `Duration::MAX`)视为永不超时。
     pub fn wait_gone(
         &mut self,
         tpl: &Template,
         timeout: Duration,
         interval: Duration,
     ) -> Result<bool> {
-        let deadline = Instant::now() + timeout;
+        let hit = self.poll(tpl, timeout, interval, false)?;
+        px_trace!(
+            op = "wait_gone",
+            result = if hit.is_none() { "gone" } else { "still_present" },
+            timeout = ?timeout,
+        );
+        Ok(hit.is_none())
+    }
+
+    /// 轮询到"是否命中"符合 `want_hit` 为止:满足立即返回,`timeout` 到点返回最后一次结果。
+    ///
+    /// 溢出**不当成错误也不截断成 0**,而是当成"不设截止点"——"我就一直等"是合法写法,
+    /// 库不该用一个合法的 `Duration` 把调用方当场炸掉(`Instant + Duration` 溢出会 panic)。
+    fn poll(
+        &mut self,
+        tpl: &Template,
+        timeout: Duration,
+        interval: Duration,
+        want_hit: bool,
+    ) -> Result<Option<Match>> {
+        let deadline = Instant::now().checked_add(timeout);
         loop {
-            if self.find_on_screen(tpl)?.is_none() {
-                px_trace!(op = "wait_gone", result = "gone", timeout = ?timeout);
-                return Ok(true);
+            let m = self.find_on_screen(tpl)?;
+            if m.is_some() == want_hit {
+                return Ok(m);
             }
             let now = Instant::now();
-            if now >= deadline {
-                px_trace!(op = "wait_gone", result = "still_present", timeout = ?timeout);
-                return Ok(false);
+            if let Some(deadline) = deadline {
+                if now >= deadline {
+                    return Ok(m);
+                }
+                std::thread::sleep(interval.min(deadline - now));
+            } else {
+                std::thread::sleep(interval);
             }
-            std::thread::sleep(interval.min(deadline - now));
         }
     }
 
-    /// 截一屏并找全部不重叠匹配(至多 `max` 个,`max=0` 不限)。
+    /// 截一屏并找全部不重叠匹配(至多 `max` 个,`max=0` 不限),按 `(y, x)` 升序
+    /// 返回**屏幕绝对坐标**。
+    ///
+    /// 顺序与去重口径见 [`Matcher::find_all`];中心点可用 [`Match::center`] 折算。
     pub fn find_all_on_screen(&mut self, tpl: &Template, max: usize) -> Result<Vec<Match>> {
         let (_, origin) = self.grab_scoped()?;
         let region = self.search_rect(origin);
@@ -230,13 +273,19 @@ impl Finder {
     /// 截一屏找模板,返回**模板中心**的屏幕坐标(省去手动加半尺寸)。
     ///
     /// 命中时 `Match.x`/`Match.y` = 左上角 + 宽高的一半(整数除法)。
-    /// 适合"找到后直接点击中心"的场景。
+    /// 适合"找到后直接点击中心"的场景。多结果要用中心点,请对 [`find_all_on_screen`]
+    /// 的每个命中调用 [`Match::center`]。
+    ///
+    /// [`find_all_on_screen`]: Finder::find_all_on_screen
     pub fn find_center_on_screen(&mut self, tpl: &Template) -> Result<Option<Match>> {
         let m = self.find_on_screen(tpl)?;
-        Ok(m.map(|m| Match {
-            x: m.x + tpl.width as i32 / 2,
-            y: m.y + tpl.height as i32 / 2,
-            score: m.score,
+        Ok(m.map(|m| {
+            let (x, y) = m.center(tpl);
+            Match {
+                x,
+                y,
+                score: m.score,
+            }
         }))
     }
 
@@ -312,14 +361,51 @@ impl Finder {
     /// `Some`)时只截该区域——省掉一次整屏拷贝与后续裁剪。此时帧内坐标是**区域
     /// 相对**的,第二个返回值就是需要加回的偏移;不支持则为 `(changed, (0, 0))`,
     /// 行为与旧版"截全屏再按 region 裁剪"完全一致。
+    ///
+    /// 区域直抓拿的是新缓冲,后端无从报告"这屏和上次一样",所以这里**就地逐字节
+    /// 比对补齐**:布局(尺寸 + 通道序)一致且像素全同就回报未变化 —— 否则
+    /// "盯着一小块区域反复轮询"这条最该吃到静态帧跳过的路径会让缓存 100% 失效
+    /// (实测:连续 3 次查找从 1 次搜索退化成 3 次)。内容相同时留用旧帧,省一次
+    /// 整帧写回;代价是这一帧新缓冲白 allocate 一次,由 `grab_region` 的 API 形状决定。
     fn grab_scoped(&mut self) -> Result<(bool, (i32, i32))> {
         if let Some(r) = self.region {
             if let Some(f) = self.capture.grab_region(r)? {
-                self.frame = f;
-                return Ok((true, (r.x as i32, r.y as i32)));
+                let changed = frame_differs(&self.frame, &f);
+                if changed {
+                    self.frame = f;
+                }
+                self.warn_if_region_offscreen();
+                return Ok((changed, (r.x as i32, r.y as i32)));
             }
         }
-        Ok((self.capture.grab_into(&mut self.frame)?, (0, 0)))
+        let changed = self.capture.grab_into(&mut self.frame)?;
+        self.warn_if_region_offscreen();
+        Ok((changed, (0, 0)))
+    }
+
+    /// region 与刚抓到的画面**完全不相交**时提示一次(开 feature `tracing` 才有输出)。
+    ///
+    /// 这是"region 坐标写错了"最典型的表现:结果只是安静的 `None`,与"屏幕上确实
+    /// 没有该模板"无从区分。这里**不返回 `Err`**:`None` 本来就是合法结果,而副屏 /
+    /// 窗口后端的坐标原点未必从 (0,0) 开始,把"暂时不相交"判成错误会打断合法的轮询脚本。
+    fn warn_if_region_offscreen(&mut self) {
+        let Some(r) = self.region else {
+            return;
+        };
+        if self.frame.width == 0 || self.frame.height == 0 {
+            return; // 还没抓到有效帧,谈不上"不相交"
+        }
+        let c = self.frame.clamp(r);
+        if (c.width != 0 && c.height != 0) || self.region_offscreen_warned {
+            return;
+        }
+        self.region_offscreen_warned = true;
+        px_warn!(
+            region = format!("({},{},{}x{})", r.x, r.y, r.width, r.height),
+            frame = format!("{}x{}", self.frame.width, self.frame.height),
+            backend = self.capture.backend(),
+            "region 与抓到的画面完全不相交,该区域不会有任何命中:检查坐标是否写错,或目标是否在另一块显示器上",
+        );
     }
 
     /// 本次搜索应在帧内哪个矩形上进行。
@@ -357,6 +443,8 @@ impl Finder {
         self.region = region;
         self.cache_key = None;
         self.cache_result = None;
+        // 新区域重新给一次不相交提示的机会(见 `warn_if_region_offscreen`)。
+        self.region_offscreen_warned = false;
     }
 
     /// 缓存键 = 模板内容指纹 ^ 区域指纹。
@@ -372,6 +460,17 @@ impl Finder {
         };
         tpl.content_key() ^ rk.rotate_left(32)
     }
+}
+
+/// 两帧内容是否不同。
+///
+/// 布局(尺寸 + 通道序)不一致时**必然算不同**:下标不再一一对应,没有可比性
+/// (与 [`Finder::diff_since_last`] 遇到布局变化时"保守视为全变"同一口径)。
+fn frame_differs(prev: &Frame, next: &Frame) -> bool {
+    prev.width != next.width
+        || prev.height != next.height
+        || prev.format != next.format
+        || prev.pixels != next.pixels
 }
 
 /// [`Finder`] 的构建器。
@@ -740,6 +839,99 @@ mod tests {
         // 帧内 (1,2) + 区域原点 (20,16)
         assert_eq!((hit.x, hit.y), (21, 18));
         assert_eq!((finds.get(), find_ins.get()), (1, 0));
+    }
+
+    /// 区域直抓、内容恒定不变的后端(模拟"盯着一小块静态区域轮询")。
+    struct StaticRegion;
+    impl Capture for StaticRegion {
+        fn grab(&mut self) -> Result<Frame> {
+            Ok(Frame::bgra8(32, 32, vec![9u8; 32 * 32 * 4]))
+        }
+        fn grab_region(&mut self, r: Rect) -> Result<Option<Frame>> {
+            Ok(Some(Frame::bgra8(
+                r.width,
+                r.height,
+                vec![9u8; r.width * r.height * 4],
+            )))
+        }
+        fn backend(&self) -> &'static str {
+            "mock-static-region"
+        }
+    }
+
+    /// 回归:region 直抓时后端报不出"没新帧",缓存不能因此 100% 失效。
+    #[test]
+    fn region_grab_still_uses_static_frame_cache() {
+        let (m, finds, find_ins) = spy();
+        let mut f = Finder::new(Box::new(StaticRegion), Box::new(m));
+        f.set_region(Some(Rect::new(4, 4, 24, 24)));
+        assert!(f.find_on_screen(&target_tpl()).unwrap().is_some());
+        assert!(f.find_on_screen(&target_tpl()).unwrap().is_some());
+        assert!(f.find_on_screen(&target_tpl()).unwrap().is_some());
+        assert_eq!(
+            (finds.get(), find_ins.get()),
+            (1, 0),
+            "画面逐字节未变,后两次应复用缓存"
+        );
+    }
+
+    /// 反过来:帧内容真的变了,绝不能因为"尺寸一样"就当成没变。
+    #[test]
+    fn region_grab_researches_when_pixels_change() {
+        struct TogglingRegion {
+            n: usize,
+        }
+        impl Capture for TogglingRegion {
+            fn grab(&mut self) -> Result<Frame> {
+                Ok(Frame::bgra8(24, 24, vec![9u8; 24 * 24 * 4]))
+            }
+            fn grab_region(&mut self, r: Rect) -> Result<Option<Frame>> {
+                self.n += 1;
+                let v = if self.n.is_multiple_of(2) { 8 } else { 9 };
+                Ok(Some(Frame::bgra8(
+                    r.width,
+                    r.height,
+                    vec![v; r.width * r.height * 4],
+                )))
+            }
+        }
+        let (m, finds, _) = spy();
+        let mut f = Finder::new(Box::new(TogglingRegion { n: 0 }), Box::new(m));
+        f.set_region(Some(Rect::new(4, 4, 24, 24)));
+        for _ in 0..3 {
+            assert!(f.find_on_screen(&target_tpl()).unwrap().is_some());
+        }
+        assert_eq!(finds.get(), 3, "帧内容交替变化,每次都该重搜");
+    }
+
+    /// region 完全落在画面外:语义仍是"没有命中",不是错误(提示走 tracing warn)。
+    #[test]
+    fn region_fully_offscreen_is_none_not_error() {
+        let mut f = finder_with(vec![true]);
+        f.set_region(Some(Rect::new(5000, 5000, 64, 64)));
+        assert!(
+            f.find_on_screen(&target_tpl()).unwrap().is_none(),
+            "越界区域应报告无命中,而不是 panic 或 Err"
+        );
+    }
+
+    /// 回归:`Duration::MAX` 这类加不进当前时刻的超时不该 panic,而是"一直等"。
+    /// 目标在第 3 帧出现,所以两条轮询都能自己结束。
+    #[test]
+    fn oversized_timeout_means_wait_forever_not_panic() {
+        let mut f = finder_with(vec![false, false, true]);
+        let m = f
+            .find_until(&target_tpl(), Duration::MAX, Duration::from_millis(2))
+            .expect("mock 不会出错")
+            .expect("超时的语义是不限,等到就该返回命中");
+        assert_eq!((m.x, m.y), (10, 10));
+
+        let mut f2 = finder_with(vec![true, false]);
+        assert!(
+            f2.wait_gone(&target_tpl(), Duration::MAX, Duration::from_millis(2))
+                .unwrap(),
+            "目标消失即返回 true,不应被超大 timeout 炸掉"
+        );
     }
 
     #[test]

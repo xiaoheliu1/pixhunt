@@ -61,6 +61,19 @@ macro_rules! px_timer {
     };
 }
 
+/// 用法层面的告警(坐标写错、配置明显落空等)。与 [`px_trace!`] 同样受 feature
+/// `tracing` 门控:关闭时展开为空,连参数求值都不发生。
+///
+/// 单独分一级是因为这类提示"值得用户在 warn 上看",而逐帧的性能埋点只该在 trace 上。
+#[cfg(feature = "tracing")]
+macro_rules! px_warn {
+    ($($t:tt)*) => { ::tracing::warn!(target: "pixhunt", $($t)*) };
+}
+#[cfg(not(feature = "tracing"))]
+macro_rules! px_warn {
+    ($($t:tt)*) => {};
+}
+
 pub mod capture;
 pub mod color;
 pub mod error;
