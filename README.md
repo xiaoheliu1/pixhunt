@@ -236,6 +236,19 @@ let m = finder.find_on_screen(&Template::load("btn.png")?)?;
   小图标会把相邻目标漏报成一个。
 - **`diff_since_last` 复用基线缓冲**,不再每次重新分配整帧:1080p 实测 5.6 ms → 3.4 ms。
 
+## 升级到 v0.8 (breaking)
+破坏面集中在 `Template` 的字段与两处行为变化:
+
+| v0.7 | v0.8 |
+| --- | --- |
+| `Template` 只有 `rgb` / `width` / `height` 三个字段 | 多出 `pub mask: Option<Vec<bool>>`。用结构体字面量手工构造的代码需要补这个字段;走 `load` / `from_rgb` / `from_rgba` 构造的**不受影响** |
+| `find_all` 按整张模板的外接框抑制重叠 | 带掩码的模板改按**可见像素外接框**抑制。同一张图上报的结果可能**变多**(小图标不再被大模板的外接框吞掉);无掩码时行为不变 |
+| GDI 截图失败时 `assert!` panic | 返回 `Err`。原先靠捕获 panic 兜底的写法要改成处理 `Result` |
+| 改分辨率 / 锁屏唤醒后需重建 `Finder` 才能恢复 | 后端自己跟上桌面尺寸变化,**无需重建** |
+
+另一点:`CorrMatcher` 收到带掩码的模板时,debug 构建会 `debug_assert!` 提示,因为 ZNCC 那条路径
+没有掩码接口、会给出与 `RgbMatcher` 不一致的结果。release 构建零开销,照常运行。
+
 ## 升级到 v0.7 (breaking)
 `Error::Capture` 改成命名字段变体,让截图失败能保住**错误链**:
 
