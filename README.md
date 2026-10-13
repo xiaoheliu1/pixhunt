@@ -46,7 +46,8 @@ if let Some(m) = finder.find_on_screen(&tpl)? {
 ## 功能开关 (Cargo features)
 | feature | 提供 | 平台 |
 | --- | --- | --- |
-| (默认) | `XCapCapture`(基于 xcap)+ `RgbMatcher` | 跨平台 |
+| `capture-xcap` **默认开** | `XCapCapture`、`CaptureKind::Monitor`(基于 xcap) | 跨平台 |
+| (不开任何后端) | 只剩匹配核心:`Frame` / `Template` / `RgbMatcher` / 颜色搜索 —— 画面由宿主自己抓、用 `Frame::rgba8` 注入,xcap 不进依赖树 | 跨平台 |
 | `capture-gdi` | `GdiCapture`(复用 DC + BitBlt,输出 BGRA) | 仅 Windows |
 | `capture-dxgi` | `DxgiCapture`(桌面复制,GPU 取帧) | 仅 Windows |
 | `capture-window` | `WindowCapture`(PrintWindow 截单个窗口客户区,遮挡也可截)+ `CaptureKind::WindowByTitle` | 仅 Windows |
@@ -56,10 +57,11 @@ if let Some(m) = finder.find_on_screen(&tpl)? {
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.8", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
+pixhunt = { version = "0.9", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
 ```
 
-启用后 `CaptureKind` 多出 `Gdi` / `Dxgi` / `Auto`(`Auto` 依次试 DXGI → GDI → xcap),
+启用后 `CaptureKind` 多出 `Gdi` / `Dxgi` / `Auto`(`Auto` 依次试 DXGI → GDI → xcap;
+GDI 的构造不返回错误,所以开了 `capture-gdi` 就永远走不到 xcap 那一档),
 `MatchKind` 多出 `Corr`:
 
 ```rust
@@ -247,6 +249,40 @@ let m = finder.find_on_screen(&Template::load("btn.png")?)?;
   同名字段是**逐金字塔层**的候选门槛,而粗筛层分数天然偏低,拿它当最终阈值会把真命中
   整条链路削空。
 
+## v0.9 变更
+
+次版本号级别:新增一个可插拔能力 + 一批修复加固。**默认开启 `capture-xcap`,桌面用户的体验与 0.8.x 完全一致**。
+
+新增能力:
+
+- **xcap 后端改为可选**:新增 feature `capture-xcap`(默认开)。`default-features = false` 时
+  只剩匹配核心(`Frame` / `Template` / `RgbMatcher` / 颜色搜索),xcap 不进依赖树,画面由
+  宿主自己抓并用 `Frame::rgba8` 注入 —— 面向安卓 / iOS 等**没有截屏后端**的平台(如 Kotlin
+  MediaProjection 抓帧喂进来)。`CaptureKind::Monitor` / `XCapCapture` 仅在此开关打开时存在。
+  ⚠️ 语义变化:0.8.2 里 xcap 是硬依赖、`default = []`,`default-features = false` 与开默认毫无
+  区别(拿不到 xcap 的唯一方式以前不存在);现在 `default-features = false` 会真的剔除 xcap。
+  此前没有任何配置会因此从"能用"变"不能用",只是新开了一条 core-only 用法。
+
+修复:
+
+- **GDI 后端改分辨率那一帧的尺寸同步顺序**:`GdiCapture::grab` / `grab_into` 此前先读旧尺寸
+  再触发内部重建,导致分辨率变化的那一帧 `Frame::width/height` 与 `pixels` 缓冲不是同一个尺寸
+  —— 新尺寸更大时是一张静默错位的画面(找图莫名全灭),新尺寸更小时按下标读到缓冲之外。
+  改成先重建、再取尺寸(与 `WindowCapture` 的正确写法一致),并加 `debug_assert` 兜住。
+  ⚠️ 这一条是**代码推断**:要真改一次分辨率才能复现,本机没构造出该场景,未跑通前后对比。
+- **`Template::load` 挡住解压炸弹**:先把文件头里的宽高拿来做 `checked_mul` + 4000 万像素上限
+  校验,不超线才真正解码;超限返回 `Err(Error::Image(ImageError::Limits(..)))`。此前直接按
+  文件头声明的尺寸分配,一张几百 KB 却写巨大尺寸的 PNG 能把内存打死。
+
+文档 / 门禁:
+
+- **DXGI 多显示器选屏语义更正**:`DxgiCapture` 取的是 `EnumAdapters(0)` + `EnumOutputs(0)`,
+  单显卡时那就是主屏,多显卡(核显 + 独显)时**不保证**是主显示器;README/`docs/GUIDE.md` 补上
+  "各后端到底抓哪一块屏"的说明与副屏排查提示。
+- **CI 覆盖面补齐**:`--no-default-features` 现在跑**全量 test(含 doctest)**,不再用 `--lib` 绕过
+  (`src/lib.rs` 顶部示例已用 feature cfg 兜住 `CaptureKind::Monitor`);新增单后端 clippy、
+  Linux `--all-features` clippy、MSRV 的 no-default 构建,以及安卓(aarch64 / x86_64)交叉 check。
+
 ## v0.8.2 变更
 
 修订号级别:没有破坏性改动,`find_all` 的**命中集合与顺序和 v0.8.1 逐个字节相同**(测试里
@@ -394,11 +430,18 @@ cargo run --release --features capture-dxgi,capture-gdi --example find_on_screen
   编译需要:`pkg-config libclang-dev libxcb1-dev libxrandr-dev libdbus-1-dev
   libpipewire-0.3-dev libwayland-dev libegl-dev libgbm-dev`(本仓库 CI 已按此配置)。
   缺失时报的是链接错误(如 `unable to find library -lgbm`),不是编译错误。
-- **多显示器**:`Monitor` / `Gdi` / `Dxgi` 都只覆盖**主显示器**。要抓副屏,用
-  `XCapCapture::from_point(x, y)`(按屏幕坐标落在哪块屏来选显示器),再交给
-  `Finder::new(Box::new(cap), ...)`。
-- 帧字节序:GDI / DXGI 产出 BGRA,xcap / PrintWindow 产出 RGBA;`RgbMatcher` 按帧的
-  `PixelFormat` 自动映射通道,无需你手动转换。
+- **多显示器**:`Gdi` 只覆盖主显示器;`Dxgi` 取的是 `EnumAdapters(0)` + `EnumOutputs(0)`,
+  单显卡时那就是主屏,多显卡(核显 + 独显)时**不保证**;`Monitor`(xcap)默认也取主屏。
+  要抓副屏,用 `XCapCapture::from_point(x, y)`(按屏幕坐标落在哪块屏来选显示器),再交给
+  `Finder::new(Box::new(cap), ...)`;或者用 `WindowCapture` 直接盯那个窗口。
+- 帧字节序:GDI / DXGI / PrintWindow(`WindowCapture`)产出 **BGRA**,xcap 产出 **RGBA**;
+  `RgbMatcher` 按帧的 `PixelFormat` 自动映射通道,无需你手动转换。自己拿像素做后续
+  (存盘、送 OCR、转 `RgbaImage`)时这一步要看清,BGRA 当成 RGBA 用就是 R/B 整体互换。
+- **多线程**:`Finder` 既不是 `Send` 也不是 `Sync`(它的字段是 `Box<dyn Capture>` /
+  `Box<dyn Matcher>`,trait object 不会自动继承这两个标记),而且默认后端 `XCapCapture`
+  本身也不是 `Send`(xcap 内部持有裸指针)。所以别想着把一个 `Finder` 传给线程或塞进
+  `Arc`:要并发就在**每个线程里各自 `build()` 一个**(`Template` 是 `Send + Sync`,
+  clone 进去即可),这种写法本机实测可编译。
 - **平坦内容会让 `Rgb` 退化**:当模板与搜索区域**都**近乎单色(相邻像素几乎没有差异)
   时,锚点与逐像素早失败全部失效,扫描退化为暴力全量。1080p + 64px 实测:有纹理
   ~3ms,零方差模板放在纯色背景上 ~1.9s(慢 600 倍),且平坦区里会有多个"等价"命中点。

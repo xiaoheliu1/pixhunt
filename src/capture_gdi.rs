@@ -147,6 +147,10 @@ pub struct GdiCapture {
 
 impl GdiCapture {
     /// 在主显示器上创建(仅 Windows)。
+    ///
+    /// 尺寸取的是 `GetDC(NULL)` + `HORZRES/VERTRES`,即**主显示器那一块**,不含副屏,
+    /// 也不含负坐标区域。多屏时要按坐标选屏请用 `XCapCapture::from_point`,要盯
+    /// 某个窗口请用 `WindowCapture`。
     pub fn new_primary() -> Self {
         GdiCapture {
             inner: FastCap::new_primary(),
@@ -156,17 +160,30 @@ impl GdiCapture {
 
 impl Capture for GdiCapture {
     fn grab(&mut self) -> Result<Frame> {
+        // 先跟到当前桌面尺寸再取尺寸:`FastCap::grab_into` 自己也会 resize,它跑在
+        // 前面时才能交出与缓冲一致的尺寸(见 `grab_into` 的说明)。
+        self.inner.resize_if_needed();
         let (w, h) = self.inner.size();
         // 缓冲由 FastCap::grab_into 负责扩到 w*h*4,这里不必先填一遍零。
         let mut pixels = Vec::new();
         self.inner.grab_into(&mut pixels)?;
+        debug_assert_eq!(pixels.len(), w * h * 4, "抓屏写出的帧尺寸与缓冲不一致");
         Ok(Frame::bgra8(w, h, pixels))
     }
 
     fn grab_into(&mut self, dst: &mut Frame) -> Result<bool> {
+        // 顺序不能反!`FastCap::grab_into` 开头会 `resize_if_needed()`,并把
+        // `dst.pixels` 按**它自己的**新尺寸 `resize`。如果像旧代码那样先读旧尺寸,
+        // 分辨率一变(改分辨率 / 改缩放 / 切主屏 / RDP 重连)就会出现
+        // `dst.width*height` 是新尺寸而像素是旧尺寸(或反过来)的帧:
+        // 前者是静默的错位画面(行距对不上,匹配结果乱跳),后者会在
+        // 匹配路径的切片下标上直接 panic —— 与本文件"GDI 失败返 Err 而不是 panic"
+        // 的约定相违。先 resize 再取尺寸,两边就总是同一个值。
+        self.inner.resize_if_needed();
         let (w, h) = self.inner.size();
         dst.prepare_bgra(w, h);
         self.inner.grab_into(&mut dst.pixels)?;
+        debug_assert_eq!(dst.pixels.len(), w * h * 4, "抓屏写出的帧尺寸与缓冲不一致");
         Ok(true) // GDI 无从判断画面是否变化,保守视为已变
     }
 

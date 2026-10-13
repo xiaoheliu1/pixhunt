@@ -18,10 +18,12 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory2, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
 };
 
 /// 单次取帧的等待上限(毫秒)。超时视为"无新帧"。
@@ -94,6 +96,22 @@ impl DxgiInner {
             let w = od.ModeDesc.Width as usize;
             let h = od.ModeDesc.Height as usize;
             let fmt: DXGI_FORMAT = od.ModeDesc.Format;
+            // 下面的回拷把两件事写死了:每像素 4 字节,且内存里就是 B/G/R/A 顺序。
+            // 本机实测 DuplicateOutput 给的就是 `B8G8R8A8_UNORM`(值 87),但这不是
+            // 保证:开启 HDR / 10bit 输出时会上报 `R16G16B16A16_FLOAT`(8 字节/像素),
+            // 硬拷会把一行只读一半,得出一张噪声画面并**静默匹配失败**。在这里报错
+            // 比那个结果好得多:`CaptureKind::Auto` 会退到 GDI/xcap,调用方能看见原因。
+            if fmt != DXGI_FORMAT_B8G8R8A8_UNORM {
+                return Err(windows::core::Error::new(
+                    DXGI_ERROR_UNSUPPORTED,
+                    format!(
+                        "unexpected desktop duplication format {} (want B8G8R8A8_UNORM, \
+                         the copy loop below assumes 4 bytes per pixel)",
+                        fmt.0
+                    )
+                    .into(),
+                ));
+            }
 
             let mut desc = std::mem::zeroed::<D3D11_TEXTURE2D_DESC>();
             desc.Width = w as u32;
@@ -164,7 +182,7 @@ impl DxgiInner {
                         // (释放那个 COM 引用),重试就不可能悄悄漏掉一个引用计数。
                         res = None;
                         self.rebuild_duplication().map_err(|e| {
-                            Error::capture(format!("dxgi duplication rebuild failed: {e}"))
+                            Error::capture_from("dxgi duplication rebuild failed", e)
                         })?;
                         match self.duplication.AcquireNextFrame(
                             ACQUIRE_TIMEOUT_MS,
@@ -190,6 +208,7 @@ impl DxgiInner {
 
             // 只有收到新帧,或还没抓过任何帧时,才回拷(否则 dst 已是最新)。
             let need = fresh || !self.have_frame;
+            let mut wrote = false;
             if need {
                 let mut mapped = std::mem::zeroed::<D3D11_MAPPED_SUBRESOURCE>();
                 if self
@@ -197,9 +216,19 @@ impl DxgiInner {
                     .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                     .is_ok()
                 {
+                    let row = self.w * 4;
+                    // 回拷前的最后一道契约:行距不能小于一行要的字节数。带 padding
+                    // 的行距(大于 `row`)是安全的,小于就是越界读 —— 今天由上面的格式
+                    // 检查间接保证,但 Map 的结果属于驱动,不该拿安全当免费。
+                    if (mapped.RowPitch as usize) < row {
+                        self.context.Unmap(&self.staging, 0);
+                        return Err(Error::capture(format!(
+                            "dxgi staging RowPitch {} < row bytes {row}",
+                            mapped.RowPitch
+                        )));
+                    }
                     dst.prepare_bgra(self.w, self.h);
                     let src = mapped.pData as *const u8;
-                    let row = self.w * 4;
                     let dst_ptr = dst.pixels.as_mut_ptr();
                     for y in 0..self.h {
                         std::ptr::copy_nonoverlapping(
@@ -210,9 +239,14 @@ impl DxgiInner {
                     }
                     self.context.Unmap(&self.staging, 0);
                     self.have_frame = true;
+                    wrote = true;
                 }
             }
-            Ok(fresh)
+            // 只要动过 `dst` 就不能回报"画面未变":重建后、系统还没推新帧的那一帧里,
+            // `fresh` 是 false 但我们仍然把新分辨率的 staging(可能全黑)写进了 `dst`。
+            // 上层按"未变"走缓存的话,会拿到上一个分辨率下算出的命中坐标去点鼠标。
+            // 首帧同理(没有"上次"可比,说"变了"最保守)。
+            Ok(fresh || wrote)
         }
     }
 }
@@ -224,6 +258,12 @@ pub struct DxgiCapture {
 
 impl DxgiCapture {
     /// 尝试建立桌面复制;无 D3D / RDP / 锁屏等场景返回 `None`。
+    ///
+    /// **选屏是按 `EnumAdapters(0)` + `EnumOutputs(0)` 定的**,即"第一个显卡的第一个
+    /// 输出"。单显卡机器上它就是主屏;多显卡(核显 + 独显)时这个顺序由驱动决定,
+    /// **不保证是主显示器** —— 表现是画面能抓到、坐标也对,只是抓的是另一块屏。
+    /// 要按坐标选屏请用 `XCapCapture::from_point`(需 feature `capture-xcap`),要盯
+    /// 某个窗口请用 `WindowCapture`(需 feature `capture-window`)。
     pub fn new_primary() -> Option<Self> {
         DxgiInner::try_new().ok().map(|inner| DxgiCapture { inner })
     }

@@ -1,7 +1,9 @@
 //! 截图"插座":怎么拿到一帧画面。
 
 use crate::frame::{Frame, Rect};
-use crate::{Error, Result};
+#[cfg(feature = "capture-xcap")]
+use crate::Error;
+use crate::Result;
 
 /// 可插拔的截图后端。实现 [`Capture::grab`] 即可接入新的抓屏方式(如 GDI / DXGI)。
 pub trait Capture {
@@ -39,6 +41,7 @@ pub trait Capture {
 /// `step` 写清是哪次调用失败(单看 `xcap error` 无法区分枚举显示器与抓帧),
 /// 原始错误保留在 `source`:xcap 自己还会再包一层 io / D-Bus / Win32 错误,
 /// 断链后这些才是真正可诊断的信息就取不出来了。
+#[cfg(feature = "capture-xcap")]
 fn xcap_err(step: impl Into<String>, e: xcap::XCapError) -> Error {
     Error::capture_from(format!("xcap {}", step.into()), e)
 }
@@ -47,10 +50,12 @@ fn xcap_err(step: impl Into<String>, e: xcap::XCapError) -> Error {
 ///
 /// 一个实例绑定一个显示器,`Monitor` 对象**可长期复用**(内部只存显示器句柄与几何
 /// 信息),每帧 `grab` 不会重新枚举显示器。
+#[cfg(feature = "capture-xcap")]
 pub struct XCapCapture {
     monitor: xcap::Monitor,
 }
 
+#[cfg(feature = "capture-xcap")]
 impl XCapCapture {
     /// 主显示器(拿不到主显示器标记时退化为枚举到的第一个)。
     pub fn primary() -> Result<Self> {
@@ -80,6 +85,7 @@ impl XCapCapture {
     }
 }
 
+#[cfg(feature = "capture-xcap")]
 impl Capture for XCapCapture {
     fn grab(&mut self) -> Result<Frame> {
         let img = self
@@ -116,7 +122,14 @@ impl Capture for XCapCapture {
             rect.width as u64,
             rect.height as u64,
         );
-        if w == 0 || h == 0 || x + w > mw || y + h > mh {
+        // 用 `checked_add` 而不是 `x + w > mw`:`rect` 的字段是 `usize`(用户可以直接递
+        // 一个写歪的值),加法在 release 下回绕会算出一个**变小**的和,刚好让越界检查
+        // 通过,再把截断过的坐标交给 xcap。
+        if w == 0
+            || h == 0
+            || x.checked_add(w).is_none_or(|s| s > mw)
+            || y.checked_add(h).is_none_or(|s| s > mh)
+        {
             return Ok(None);
         }
         let img = self

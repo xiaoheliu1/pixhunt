@@ -60,17 +60,36 @@ impl PrintCap {
     }
 
     /// 客户区尺寸变化时重建位图与 BITMAPINFO。
+    ///
+    /// 顺序和失败处理都不能省:`CreateCompatibleBitmap` 在进程 GDI 对象配额用尽时会
+    /// 失败并返回无效句柄。旧写法无脑把它选进 DC(`SelectObject` 对无效句柄不会生效)、
+    /// 再 `DeleteObject` 那张仍被 DC 选中的旧位图(删不掉),然后还把新尺寸写进
+    /// `w/h/bmi` —— 从此 `GetDIBits` 永远返回 0,而下一次 `resize_if_needed` 又因为
+    /// "尺寸没变"直接早退,这个实例**再也回不来**(即使 GDI 资源已经释放)。
     fn resize_if_needed(&mut self) {
         let (w, h) = client_size(self.hwnd);
         if w == self.w && h == self.h {
             return;
         }
+        if w == 0 || h == 0 {
+            // 窗口被最小化/暂时没客户区:只记 0 尺寸,让 `grab_into` 报那句有用的错误。
+            // 旧位图留在 DC 里不动 —— 等窗口恢复尺寸时再换入新的,那时旧的就绪可删。
+            self.w = w;
+            self.h = h;
+            return;
+        }
         unsafe {
-            let new_hbmp = CreateCompatibleBitmap(self.hdc_win, w.max(1) as i32, h.max(1) as i32);
+            let new_hbmp = CreateCompatibleBitmap(self.hdc_win, w as i32, h as i32);
+            if new_hbmp.is_invalid() {
+                // 建不出来就沿用旧对象与旧尺寸,下一帧再试;不能改 `w/h/bmi`,
+                // 否则位图尺寸与 bmi 不一致,错位画面不会自行恢复。
+                return;
+            }
+            // 先换入新位图:被换出的那张此刻已不属于任何 DC,这时才能删。
             SelectObject(self.hdc_mem, new_hbmp);
             let _ = DeleteObject(self.hbmp);
             self.hbmp = new_hbmp;
-            self.bmi = make_bmi(w.max(1), h.max(1));
+            self.bmi = make_bmi(w, h);
         }
         self.w = w;
         self.h = h;

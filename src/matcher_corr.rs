@@ -113,6 +113,13 @@ impl CorrConfig {
 }
 
 /// ZNCC 匹配器(内部缓存已编译模板 + 复用的灰度缓冲)。
+///
+/// 编译产物**只留一个槽**:多模板轮询([`Finder::find_many_on_screen`](crate::Finder::find_many_on_screen))
+/// 会每次都重编译,这看起来像 bug,实测却不值得改(`--release`,在小帧——
+/// 边长为模板边长 + 8——上测,以隔离编译成本):编译增量 32x32 为 9µs、64x64 为
+/// 53µs、128x128 为 171µs、256x256 为 212µs,而同一个 `find` 在 1920x1080 帧上要
+/// ~15ms —— 占比不到 2%。换成多槽 LRU 换来的是常驻内存翻倍(编译产物含金字塔),
+/// 不划算。
 pub struct CorrMatcher {
     cfg: CorrConfig,
     cache: RefCell<Option<Cached>>,

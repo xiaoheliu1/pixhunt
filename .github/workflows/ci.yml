@@ -55,6 +55,39 @@ jobs:
       - name: Test (parallel)
         run: cargo test --release --features parallel
 
+      # 剔除全部截图后端(只取匹配核心、帧由宿主注入)—— xcap 变成可选 feature
+      # 之后这是新增的用法,之前从没编译过:examples/find_on_screen.rs 里漏加的 cfg
+      # 就是靠这两步暴露的。不带 --lib,doctest 一并纳入(src/lib.rs 顶部示例已用
+      # feature cfg 兜住 CaptureKind::Monitor,no-default-features 下能编过)。
+      - name: Test (no default features)
+        run: cargo test --release --no-default-features
+
+      - name: Clippy (no default features)
+        run: cargo clippy --release --all-targets --no-default-features -- -D warnings
+
+      # 只留一个 Windows 后端:auto_capture 的退让链在这里才会走到没编进 GDI 那一档。
+      # 三个后端各自单跑一遍才能暴露"某个后端自己的 cfg 写错"(共用 feature `windows`
+      # 时,只开 dxgi 是看不见 gdi/window 模块里的错误的)。
+      - name: Clippy (single Windows backend) [windows]
+        if: matrix.os == 'windows-latest'
+        run: cargo clippy --release --all-targets --no-default-features --features capture-dxgi -- -D warnings
+
+      - name: Clippy (gdi only) [windows]
+        if: matrix.os == 'windows-latest'
+        run: cargo clippy --release --all-targets --no-default-features --features capture-gdi -- -D warnings
+
+      - name: Clippy (window only) [windows]
+        if: matrix.os == 'windows-latest'
+        run: cargo clippy --release --all-targets --no-default-features --features capture-window -- -D warnings
+
+      # --all-features 在 Linux 上的依赖解析是合法的(`dep:windows` 指向只声明在
+      # `[target.'cfg(windows)'.dependencies]` 的可选依赖,不匹配的平台会直接跳过它),
+      # 但"能不能编"只在 docs.rs 的 Linux 构建里验证过 —— 这里显式跑一次,
+      # 顺便把 cfg(windows) 门外的代码形态也编一遍。
+      - name: Clippy (all features) [linux]
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --release --all-targets --all-features -- -D warnings
+
       - name: Test (all features) [windows]
         if: matrix.os == 'windows-latest'
         run: cargo test --release --all-features
@@ -116,3 +149,29 @@ jobs:
             libpipewire-0.3-dev libwayland-dev libegl-dev libgbm-dev
       - name: Build (default features)
         run: cargo build --release
+      # 不开任何后端的用法(帧由宿主注入,如 Kotlin MediaProjection)在 CI 里只有
+      # test job 的 stable 覆盖过;这里是它的最小构建,不需要任何系统库。
+      - name: Build (no default features)
+        run: cargo build --release --no-default-features
+
+  # 无截屏后端的平台(安卓/iOS):这是 `default-features = false` 唯一真实的使用
+  # 场景,而且跟桌面共用同一份 cfg 门控代码,编错了只有交叉编译时才暴露。
+  # 不需要系统库(xcap 被剔掉了),所以比 test job 便宜得多。
+  nodisplay:
+    name: cross-check without capture backends
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-linux-android, x86_64-linux-android]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check (core only)
+        run: cargo check --release --all-targets --no-default-features --target ${{ matrix.target }}
+      - name: Check (core + corr + parallel + tracing)
+        run: cargo check --release --no-default-features --features match-corr,parallel,tracing --target ${{ matrix.target }}

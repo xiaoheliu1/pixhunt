@@ -3,7 +3,8 @@
 //! 快速的**屏幕找图**库:截一帧屏幕,在其中定位一张小图(模板)的坐标。
 //!
 //! 两个"可插拔插座":
-//! - [`Capture`] —— 怎么拿到画面:跨平台的 `XCapCapture`(基于 xcap),
+//! - [`Capture`] —— 怎么拿到画面:跨平台的 `XCapCapture`(feature `capture-xcap`,
+//!   默认开启;无截屏后端的平台可关掉,改用 [`Frame::rgba8`] 由宿主注入像素),
 //!   以及 Windows 上更快的 `GdiCapture` / `DxgiCapture` 与截单个窗口的
 //!   `WindowCapture`(feature 门控)。
 //! - [`Matcher`] —— 怎么找模板:内置极速 [`RgbMatcher`]
@@ -20,6 +21,7 @@
 //! 开 `tracing` 输出 trace 级诊断事件(截图耗时、缓存跳过、命中与否),排查"为什么找不到"。
 //!
 //! ```no_run
+//! # #[cfg(feature = "capture-xcap")] { // CaptureKind::Monitor 需要 xcap 后端;关掉时整段编成空 main。
 //! use pixhunt::{Finder, CaptureKind, MatchKind, Template};
 //! let tpl = Template::load("template.png").unwrap();
 //! let mut finder = Finder::builder()
@@ -30,6 +32,7 @@
 //! if let Some(m) = finder.find_on_screen(&tpl).unwrap() {
 //!     println!("found at ({}, {})", m.x, m.y);
 //! }
+//! # }
 //! ```
 //!
 //! ## 说明
@@ -102,7 +105,9 @@ mod matcher_corr;
 #[cfg(feature = "match-corr")]
 pub use matcher_corr::{CorrConfig, CorrMatcher};
 
-pub use capture::{Capture, XCapCapture};
+pub use capture::Capture;
+#[cfg(feature = "capture-xcap")]
+pub use capture::XCapCapture;
 pub use color::{ColorBlob, ColorSpec, FindColor};
 pub use error::{Error, Result};
 pub use finder::{CaptureKind, Finder, MatchKind};

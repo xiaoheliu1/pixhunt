@@ -347,8 +347,19 @@ impl RowDedup {
     }
 
     /// 推进到第 `y` 行:滑出 y 方向窗口(行号差 `>= h`)的保留行,撤销它们的覆盖标记。
+    ///
+    /// 减法用 `saturating_sub`:调用方必须按 (y,x) 升序喂入(下面的 `debug_assert`),
+    /// 万一将来有人乱序喂,普通 `y - fy` 在 release 下会回绕成一个巨大值,把整个窗口
+    /// 当成"已滑出"清空 —— 结果只是不去重、多给几个重叠命中,却很难查;饱和减则退成
+    /// 保守的"不出队",至少语义还是对的。
     fn advance_to(&mut self, y: usize) {
-        while matches!(self.window.front(), Some(&(fy, _)) if y - fy >= self.h) {
+        if let Some(&(last_y, _)) = self.window.back() {
+            debug_assert!(
+                last_y <= y,
+                "RowDedup 必须按 (y,x) 升序喂入:窗口里第 {last_y} 行比当前行 {y} 还晚"
+            );
+        }
+        while matches!(self.window.front(), Some(&(fy, _)) if y.saturating_sub(fy) >= self.h) {
             if let Some((_, kept)) = self.window.pop_front() {
                 for x in kept {
                     self.shift(x, false);
@@ -838,26 +849,26 @@ mod tests {
         );
     }
 
+    /// 朴素参照:O(n²),语义即文档所述((y,x) 升序、保留先遇到的)。两个对拍用例共用。
+    fn naive(w: usize, h: usize, cands: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let mut sorted = cands.to_vec();
+        sorted.sort_unstable_by_key(|&(x, y)| (y, x));
+        let mut kept: Vec<(usize, usize)> = Vec::new();
+        for c in sorted {
+            let clash = kept.iter().any(|k| {
+                (k.0 as i64 - c.0 as i64).abs() < w as i64
+                    && (k.1 as i64 - c.1 as i64).abs() < h as i64
+            });
+            if !clash {
+                kept.push(c);
+            }
+        }
+        kept
+    }
+
     /// 滑窗去重必须与"每个候选和全部已保留项两两比一遍"的朴素参照逐字节一致。
     #[test]
     fn row_dedup_matches_naive_reference() {
-        // 朴素参照:O(n²),语义即文档所述((y,x) 升序、保留先遇到的)。
-        fn naive(w: usize, h: usize, cands: &[(usize, usize)]) -> Vec<(usize, usize)> {
-            let mut sorted = cands.to_vec();
-            sorted.sort_unstable_by_key(|&(x, y)| (y, x));
-            let mut kept: Vec<(usize, usize)> = Vec::new();
-            for c in sorted {
-                let clash = kept.iter().any(|k| {
-                    (k.0 as i64 - c.0 as i64).abs() < w as i64
-                        && (k.1 as i64 - c.1 as i64).abs() < h as i64
-                });
-                if !clash {
-                    kept.push(c);
-                }
-            }
-            kept
-        }
-
         let (x_lo, x_hi, y_hi) = (3usize, 40usize, 24usize);
         // 线性同余伪随机,固定种子,失败可复现。
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
@@ -920,6 +931,81 @@ mod tests {
                 }
                 let got_s: Vec<(i32, i32)> = out_s.iter().map(|m| (m.x, m.y)).collect();
                 assert_eq!(got_s, want, "w={w} h={h} 流式扫描与朴素参照不一致");
+            }
+        }
+    }
+
+    /// 端到端随机对拍:上面那条合成用例只喂候选坐标,碰不到真实 `scan_streaming` 里
+    /// 两条只有走生产路径才会命中的分支 —— "覆盖图为空时不读覆盖图"的免读快路径,
+    /// 和"攒够 `max` 当场返回"。这条直接调 `find_all`,参照是"暴力把命中扫全 →
+    /// 朴素邻域抑制 → 截断到 max"。
+    ///
+    /// 画面只用两种值:模板色 `MARK` 与永远取不到它的噪声。命中集合因此完全由画面
+    /// 决定 —— 不能假设"我贴的那几块就是全部命中",重叠的两块会额外框出一处,暴力
+    /// 参照自己会把它算出来。
+    #[test]
+    fn find_all_end_to_end_matches_brute_force() {
+        const FW: usize = 24;
+        const FH: usize = 20;
+        const MARK: u8 = 200;
+
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+
+        // 从密集到稀疏都盖到:`MARK` 概率 1/den,den 越小越密(越密越轻易触发整行跳过)。
+        for (w, h) in [(1usize, 1usize), (3, 3), (2, 5), (6, 2), (5, 7), (8, 8)] {
+            for den in [2usize, 5, 14, 60] {
+                let mut px = vec![0u8; FW * FH * 4];
+                for ch in px.chunks_mut(4) {
+                    let v = if rnd() % den == 0 {
+                        MARK
+                    } else {
+                        40 + (rnd() % 120) as u8
+                    };
+                    ch[0] = v;
+                    ch[1] = v;
+                    ch[2] = v;
+                    ch[3] = 255;
+                }
+                let frame = Frame::rgba8(FW, FH, px);
+                let tpl = Template::from_rgb(vec![MARK; w * h * 3], w, h);
+
+                // 暴力参照:能整块框出 `MARK` 的位置,按 (y,x) 升序。
+                let mut hits: Vec<(usize, usize)> = Vec::new();
+                for y in 0..=(FH - h) {
+                    for x in 0..=(FW - w) {
+                        if (y..y + h)
+                            .all(|yy| (x..x + w).all(|xx| frame.pixels[(yy * FW + xx) * 4] == MARK))
+                        {
+                            hits.push((x, y));
+                        }
+                    }
+                }
+
+                // 四种 `max` 一起测:0 = 不限,其余测的正是行内早停与当场返回。
+                for max in [0usize, 1, 2, 5] {
+                    let got: Vec<(i32, i32)> = RgbMatcher::new(0)
+                        .find_all(&frame, &tpl, frame.full_rect(), max)
+                        .iter()
+                        .map(|m| (m.x, m.y))
+                        .collect();
+                    let mut want: Vec<(i32, i32)> = naive(w, h, &hits)
+                        .into_iter()
+                        .map(|(x, y)| (x as i32, y as i32))
+                        .collect();
+                    if max > 0 {
+                        want.truncate(max);
+                    }
+                    assert_eq!(
+                        got, want,
+                        "w={w} h={h} den={den} max={max} 端到端结果与暴力参照不一致"
+                    );
+                }
             }
         }
     }

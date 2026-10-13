@@ -1,8 +1,10 @@
 //! 高层封装:把"截图"和"匹配"拼成一步到位的 [`Finder`]。
 
-use crate::capture::{Capture, XCapCapture};
+use crate::capture::Capture;
+#[cfg(feature = "capture-xcap")]
+use crate::capture::XCapCapture;
 use crate::color::{self, ColorBlob, ColorSpec};
-use crate::frame::{Frame, Rect};
+use crate::frame::{Frame, PixelFormat, Rect};
 use crate::matcher::{Match, Matcher, RgbMatcher};
 use crate::template::Template;
 use crate::Result;
@@ -17,7 +19,8 @@ use crate::matcher_corr::{CorrConfig, CorrMatcher};
 
 /// 可选的截图后端。
 pub enum CaptureKind {
-    /// 跨平台保底(基于 `xcap` 库,输出 RGBA;只绑主显示器)。
+    /// 跨平台保底(基于 `xcap` 库,输出 RGBA;只绑主显示器)。需 feature `capture-xcap`。
+    #[cfg(feature = "capture-xcap")]
     Monitor,
     /// 复用型 GDI BitBlt(仅 Windows,输出 BGRA)。需 feature `capture-gdi`。
     #[cfg(all(windows, feature = "capture-gdi"))]
@@ -61,6 +64,15 @@ pub enum MatchKind {
 }
 
 /// 组装好的找图器。内部**复用一个 [`Frame`]**,逐帧查找不再重复分配像素缓冲。
+///
+/// **线程安全:`Finder` 既不是 `Send` 也不是 `Sync`**(本机 rustc 实测)。原因在它
+/// 的两个 trait object 字段:`Box<dyn Capture>` / `Box<dyn Matcher>` 不会自动继承
+/// `Send`/`Sync`;而默认后端 `XCapCapture`(feature `capture-xcap`)自身也不是
+/// `Send`(xcap 内部持有裸指针),所以光给 trait object 加 `+ Send` 也解决不了。
+/// 要并发就在**每个线程里各自 [`FinderBuilder::build`] 一个**:[`Frame`] 与 [`Template`]
+/// 都是 `Send + Sync`,`Template` clone 进线程即可(这种写法实测可编译)。
+/// 注:Windows 的三个后端(`GdiCapture` / `DxgiCapture` / `WindowCapture`)单独都是
+/// `Send`,只有 xcap 不是。
 pub struct Finder {
     capture: Box<dyn Capture>,
     matcher: Box<dyn Matcher>,
@@ -330,6 +342,11 @@ impl Finder {
     /// 用途:"这块区域变了吗?""动画是否还在跑?""有没有新消息图标闪了一下"。
     /// 比较时使用 R/G/B 三通道(忽略 Alpha),任一通道差值 !=0 即计为不同。
     ///
+    /// 坐路口径:`rect` 是**屏幕绝对坐标**,与当前 `region` 无关(和其他 `*_on_screen`
+    /// 方法一致)。区域直抓时库拿到的是一张以 `region` 左上角为原点的局部帧,这里会
+    /// 先把 `rect` 换算到帧内再比。`rect` 落在**本帧覆盖范围之外**的部分不参与统计
+    /// (完全在帧外时返回 0,不是错误)。
+    ///
     /// 注意:两次截图之间**帧布局发生变化**(切换过 `region`、显示器分辨率改变、
     /// 换了后端)时,像素不再一一对应,此时保守返回区域内全部像素数(=整片都变),
     /// 并把当前帧立为新基线;下一次调用起恢复正常计数。
@@ -337,8 +354,18 @@ impl Finder {
     /// 成本:为供下次对比,这里会保留**当前整帧**的一份副本(1080p 约 8 MB),
     /// 属于"每调用一次拷一份"的量级,不适合 60 fps 级高频轮询。
     pub fn diff_since_last(&mut self, rect: Rect) -> Result<u32> {
-        let _ = self.grab_scoped()?;
-        let r = self.frame.clamp(rect);
+        let (_, origin) = self.grab_scoped()?;
+        // `rect` 是屏幕绝对坐标,而区域直抓产出的帧以 `region` 左上角为原点(见
+        // [`Capture::grab_region`] 的契约)。不先减掉帧原点就 `clamp`,任何 x/y 非 0 的
+        // `rect` 都会被夹成 0 宽,于是这个方法永远回答"区域从未变化"。
+        let hit = rect_intersect(self.frame_rect(origin), rect);
+        // 交集已经整到帧内了,不需要再 clamp。
+        let r = Rect::new(
+            hit.x - origin.0.max(0) as usize,
+            hit.y - origin.1.max(0) as usize,
+            hit.width,
+            hit.height,
+        );
         let count = match self.prev_frame.as_ref() {
             // 两帧布局一致(尺寸 + 像素格式)时,下标才对应同一个屏幕位置,可逐像素比。
             Some(prev)
@@ -409,13 +436,24 @@ impl Finder {
                 if changed {
                     self.frame = f;
                 }
-                self.warn_if_region_offscreen();
+                self.warn_if_region_offscreen((r.x as i32, r.y as i32));
                 return Ok((changed, (r.x as i32, r.y as i32)));
             }
         }
         let changed = self.capture.grab_into(&mut self.frame)?;
-        self.warn_if_region_offscreen();
+        self.warn_if_region_offscreen((0, 0));
         Ok((changed, (0, 0)))
+    }
+
+    /// 当前帧在**屏幕绝对坐标**下覆盖的矩形。全屏抓取时原点 (0,0);
+    /// 区域直抓时帧就是那张局部图,原点就是 `region` 左上角。
+    fn frame_rect(&self, origin: (i32, i32)) -> Rect {
+        Rect::new(
+            origin.0.max(0) as usize,
+            origin.1.max(0) as usize,
+            self.frame.width,
+            self.frame.height,
+        )
     }
 
     /// region 与刚抓到的画面**完全不相交**时提示一次(开 feature `tracing` 才有输出)。
@@ -423,14 +461,15 @@ impl Finder {
     /// 这是"region 坐标写错了"最典型的表现:结果只是安静的 `None`,与"屏幕上确实
     /// 没有该模板"无从区分。这里**不返回 `Err`**:`None` 本来就是合法结果,而副屏 /
     /// 窗口后端的坐标原点未必从 (0,0) 开始,把"暂时不相交"判成错误会打断合法的轮询脚本。
-    fn warn_if_region_offscreen(&mut self) {
+    fn warn_if_region_offscreen(&mut self, origin: (i32, i32)) {
         let Some(r) = self.region else {
             return;
         };
         if self.frame.width == 0 || self.frame.height == 0 {
             return; // 还没抓到有效帧,谈不上"不相交"
         }
-        let c = self.frame.clamp(r);
+        // 两边必须在同一个坐标空间里比:帧可能是区域相对的(见 `frame_rect`)。
+        let c = rect_intersect(self.frame_rect(origin), r);
         if (c.width != 0 && c.height != 0) || self.region_offscreen_warned {
             return;
         }
@@ -482,7 +521,12 @@ impl Finder {
         self.region_offscreen_warned = false;
     }
 
-    /// 缓存键 = 模板内容指纹 ^ 区域指纹。
+    /// 缓存键 = 模板内容指纹 ^ 区域指纹 ^ **帧几何(尺寸 + 通道序)**。
+    ///
+    /// 几何必须进键:分辨率变了而键不变时,会直接返回上一个布局下算出的坐标。唯一
+    /// 能走到这一步的是 DXGI:重建复制对象后、系统还没推新帧的那一帧,后端会改写
+    /// `dst` 却回报"画面未变"(`capture_dxgi::grab_into` 已经同时把这个回报修成"已变",
+    /// 这里是兜同一类问题的第二道防线)。
     fn key_of(&self, tpl: &Template) -> u64 {
         let rk = match self.region {
             None => 0u64,
@@ -493,8 +537,29 @@ impl Finder {
                     ^ (r.height as u64)
             }
         };
-        tpl.content_key() ^ rk.rotate_left(32)
+        let g = (self.frame.width as u64).wrapping_mul(2654435761)
+            ^ (self.frame.height as u64).wrapping_mul(40503)
+            ^ match self.frame.format {
+                PixelFormat::Rgba8 => 1,
+                PixelFormat::Bgra8 => 2,
+            };
+        tpl.content_key() ^ rk.rotate_left(32) ^ g.rotate_left(16)
     }
+}
+
+/// 两个**绝对坐标**矩形的交集;不相交时 `width`/`height` 为 0。
+///
+/// 减法和加法全用 `saturating_*`:`Rect` 字段是 `usize`,写歪一个 `(usize::MAX, ..)`
+/// 也不该在 release 下静默回绕成"相交"。另外 `x1` 并不保证 `>= x0`(例如
+/// 一个宽为 0 的矩形完全落在另一个之外),所以相减必须饱和。
+fn rect_intersect(a: Rect, b: Rect) -> Rect {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = a.x.saturating_add(a.width).min(b.x.saturating_add(b.width));
+    let y1 =
+        a.y.saturating_add(a.height)
+            .min(b.y.saturating_add(b.height));
+    Rect::new(x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
 }
 
 /// 两帧内容是否不同。
@@ -530,8 +595,22 @@ impl FinderBuilder {
         self.region = Some(r.into());
         self
     }
+    // 零后端组合(非 Windows 且未开 capture-xcap)下 CaptureKind 退化为空枚举,
+    // 下面的 match 永不可达是类型系统的正确结论,不是缺陷:压掉对应告警。
+    #[cfg_attr(
+        not(feature = "capture-xcap"),
+        allow(unreachable_code, unused_variables)
+    )]
     pub fn build(self) -> Result<Finder> {
-        let capture: Box<dyn Capture> = match self.capture.unwrap_or(CaptureKind::Monitor) {
+        // 无 capture-xcap 时必须显式指定后端,否则下面的 match 无默认值可退。
+        #[cfg(feature = "capture-xcap")]
+        let kind = self.capture.unwrap_or(CaptureKind::Monitor);
+        #[cfg(not(feature = "capture-xcap"))]
+        let kind = self.capture.ok_or_else(|| {
+            crate::Error::capture("no capture backend: enable a capture-* feature")
+        })?;
+        let capture: Box<dyn Capture> = match kind {
+            #[cfg(feature = "capture-xcap")]
             CaptureKind::Monitor => Box::new(XCapCapture::primary()?),
             #[cfg(all(windows, feature = "capture-gdi"))]
             CaptureKind::Gdi => Box::new(crate::capture_gdi::GdiCapture::new_primary()),
@@ -564,6 +643,10 @@ impl FinderBuilder {
 }
 
 /// 依次尝试 DXGI → GDI → xcap,返回第一个可用的。
+///
+/// 注:只要 `capture-gdi` 编进来了就永远走不到 xcap 那一档——GDI 的构造不返回错误,
+/// 拿到就用。后面两档因此各带一个 `#[allow(unreachable_code)]`:它们只在"没编进 GDI"
+/// 的组合里是活路(例如 `--no-default-features --features capture-dxgi,capture-xcap`)。
 #[cfg(all(windows, any(feature = "capture-gdi", feature = "capture-dxgi")))]
 fn auto_capture() -> Result<Box<dyn Capture>> {
     #[cfg(feature = "capture-dxgi")]
@@ -572,10 +655,18 @@ fn auto_capture() -> Result<Box<dyn Capture>> {
     }
     #[cfg(feature = "capture-gdi")]
     {
+        // GDI 的构造不返回错误,所以它之后那些分支只在没编进 GDI 时才是活路。
         return Ok(Box::new(crate::capture_gdi::GdiCapture::new_primary()));
     }
+    // `allow` 必须挂在**块语句**上:rustc 1.98 起判为不可达的是这一块本身,而不是块里
+    // 那条 `return` —— 属性原先写在 return 前面,盖不住,`-D warnings` 下直接报错。
+    #[cfg(feature = "capture-xcap")]
     #[allow(unreachable_code)]
-    Ok(Box::new(XCapCapture::primary()?))
+    {
+        return Ok(Box::new(XCapCapture::primary()?));
+    }
+    #[allow(unreachable_code)]
+    Err(crate::Error::capture("no capture backend available"))
 }
 
 #[cfg(test)]
@@ -1036,5 +1127,64 @@ mod tests {
         // 基线已重建为同一布局,内容未变时应回到 0
         let d2 = f.diff_since_last(Rect::new(0, 0, 16, 16)).unwrap();
         assert_eq!(d2, 0);
+    }
+
+    /// 区域直抓、且**帧内容会随调用次数改变**的后端。区域原点非 0,专门用来踩
+    /// "局部帧 vs 绝对 rect"这个坐标空间坑。
+    struct ShiftedRegion {
+        n: Cell<usize>,
+    }
+    impl Capture for ShiftedRegion {
+        fn grab(&mut self) -> Result<Frame> {
+            Ok(Frame::bgra8(32, 32, vec![9u8; 32 * 32 * 4]))
+        }
+        fn grab_region(&mut self, r: Rect) -> Result<Option<Frame>> {
+            let mut px = vec![9u8; r.width * r.height * 4];
+            // 从第二次抓取起,把**帧内**(2,3) 起 6x4 一小块改掉,模拟"区域里有东西动了"。
+            if self.n.get() >= 1 {
+                for y in 3..3 + 4 {
+                    for x in 2..2 + 6 {
+                        px[(y * r.width + x) * 4] = 1;
+                    }
+                }
+            }
+            self.n.set(self.n.get() + 1);
+            Ok(Some(Frame::bgra8(r.width, r.height, px)))
+        }
+    }
+
+    /// 回归:`rect` 是**屏幕绝对坐标**,而区域直抓产出的帧以 region 左上角为原点。
+    /// 不先减掉帧原点就 clamp,任何 x/y 非 0 的 rect 都会被夹成 0 宽,于是
+    /// `diff_since_last` 永远回答"这片区域从未变化"。
+    #[test]
+    fn diff_since_last_takes_absolute_rect_under_region_grab() {
+        let mut f = Finder::new(
+            Box::new(ShiftedRegion { n: Cell::new(0) }),
+            Box::new(RgbMatcher::new(0)),
+        );
+        let reg = Rect::new(1000, 400, 40, 30);
+        f.set_region(Some(reg));
+        // 首次无基线:保守报告整片变化,面积取请求的 rect。
+        assert_eq!(f.diff_since_last(reg).unwrap(), 40 * 30);
+        // 第二次帧里 (2,3) 起 6x4 变了 —— 应数出 24 个像素,而不是 0。
+        assert_eq!(f.diff_since_last(reg).unwrap(), 24);
+        // 只问没动的那一小块(绝对坐标),应为 0。
+        assert_eq!(f.diff_since_last(Rect::new(1000, 410, 8, 8)).unwrap(), 0);
+    }
+
+    /// 同一个坐标空间问题的另一面:区域直抓时拿绝对 region 去 clamp 局部帧,
+    /// 会得出"完全不相交",于是每次轮询都打一条误导性的 tracing 警告。
+    #[test]
+    fn region_grab_with_offset_does_not_flag_offscreen() {
+        let mut f = Finder::new(
+            Box::new(ShiftedRegion { n: Cell::new(0) }),
+            Box::new(RgbMatcher::new(0)),
+        );
+        f.set_region(Some(Rect::new(1000, 400, 40, 30)));
+        let _ = f.find_on_screen(&target_tpl());
+        assert!(
+            !f.region_offscreen_warned,
+            "帧本身就是该区域抓来的,不该被判成与画面不相交"
+        );
     }
 }

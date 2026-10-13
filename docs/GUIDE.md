@@ -1,7 +1,6 @@
 # pixhunt 使用说明书(从零开始)
 
-> 适用版本:**pixhunt 0.8.2**(本仓库当前版本;上一版 0.8.1 已于 2026-10-05 发布到
-> crates.io)。
+> 适用版本:**pixhunt 0.9.0**(本仓库当前版本;上一版 0.8.2 已发布到 crates.io)。
 > 读者假设:**你几乎没写过 Rust**,但你想在自己的屏幕上"找一张图在哪里",然后做点事。
 > 这份说明书覆盖**全部对外 API**、每个参数的含义、能直接复制运行的示例、以及报错怎么排查。
 
@@ -121,14 +120,14 @@ myhunter/
 
 ```toml
 [dependencies]
-pixhunt = "0.8"
+pixhunt = "0.9"
 ```
 
 想用 Windows 上更快的截图后端或更强的算法,就开对应"功能开关"(第 6 章详解):
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.8", features = ["capture-dxgi", "capture-gdi", "capture-window", "match-corr", "parallel"] }
+pixhunt = { version = "0.9", features = ["capture-dxgi", "capture-gdi", "capture-window", "match-corr", "parallel"] }
 ```
 
 改完保存。**不需要手动下载**,第一次运行 `cargo run` 时 Cargo 会自动联网抓依赖。
@@ -261,7 +260,7 @@ fn main() -> pixhunt::Result<()> {                          // 3
 | 4 | 读图片文件成模板。`?`:读不到文件(路径错、不是 PNG)就把错误抛出去 |
 | 5 | 模板的宽和高是可访问的公开字段。这一行能帮你确认"图确实读对了" |
 | 6 | 开始搭一个 `Finder`(找图器)。注意 `let mut`:第 10 行要反复用它截图,内部会变 |
-| 7 | 选截图后端。`Monitor` = 跨平台保底(xcap),不开任何 feature 也能用 |
+| 7 | 选截图后端。`Monitor` = 跨平台保底(xcap),由 feature `capture-xcap` 提供(默认开着,所以不用特意开) |
 | 8 | 选匹配算法。`Rgb { tolerance: 25 }` = 极速 RGB 比对,每通道允许 25 的误差 |
 | 9 | `build()` 可能失败(比如指定了 `Dxgi` 但这机器用不了),所以有 `Result`,要 `?` |
 | 10 | **截一屏 + 找图**。返回 `Option<Match>`:`Some` 是找到,`None` 是没有。⚠️ 这里**别打印 `m.score` 当相似度**:`Rgb` 的 score 恒为 `1.0`(见 5.6) |
@@ -384,7 +383,8 @@ Rust 的 `feature` 就是**编译时的可选开关**。库里写了很多代码
 
 | feature | 打开后多出来的东西 | 平台 |
 | --- | --- | --- |
-| (不开任何) | `XCapCapture`、`CaptureKind::Monitor`、`RgbMatcher`、颜色搜索 | 全平台 |
+| (不开任何) | 只剩**匹配核心**:`Frame`、`Template`、`RgbMatcher`、颜色搜索 —— 画面得宿主自己抓,用 `Frame::rgba8` 注进来 | 全平台 |
+| `capture-xcap` **默认开** | `XCapCapture`、`CaptureKind::Monitor` | 全平台 |
 | `capture-gdi` | `GdiCapture`、`CaptureKind::Gdi`、`CaptureKind::Auto` | 仅 Windows |
 | `capture-dxgi` | `DxgiCapture`、`CaptureKind::Dxgi`、`CaptureKind::Auto` | 仅 Windows |
 | `capture-window` | `WindowCapture`、`WindowHandle`、`CaptureKind::Window(..)`、`CaptureKind::WindowByTitle(..)` | 仅 Windows |
@@ -395,8 +395,15 @@ Rust 的 `feature` 就是**编译时的可选开关**。库里写了很多代码
 注意几个坑:
 
 - 只在 Windows 上有效的 feature,在 Linux/macOS 上打开**不会报错但也不会生效**(代码被 `#[cfg(windows)]` 关掉了)。
+- 截图后端 `xcap` 本身也是个 feature(默认开)。写 `default-features = false` 就能把整个
+  截图依赖剔掉,代价是 `XCapCapture` / `CaptureKind::Monitor` 都不存在了 —— 看过这些类型的
+  代码会**当场编译失败**(这是有意的,不会退化成运行时报错)。
 - `CaptureKind::Auto` 需要 `capture-gdi` 或 `capture-dxgi` **至少一个**打开才存在。
 - `parallel` 会通过一种叫 weak dep 的机制把并行能力**传导给 `corrmatch`**;如果你开了 `match-corr` 却没开 `parallel`,`CorrConfig.parallel` 会被自动归为 `false`(不然会更糟:静默找不到)。
+- `Finder` 既不是 `Send` 也不是 `Sync`(它的字段是 `Box<dyn Capture>` / `Box<dyn Matcher>`,
+  trait object 不自动继承这两个标记),默认后端 `XCapCapture` 自己也不是 `Send`。想多线程就
+  **每个线程各自 `build()` 一个 `Finder`**,把 `Template`(它 `Send + Sync`)clone 进线程;
+  别把一个 `Finder` 在线程之间传递或塞进 `Arc`。
 - 开 `match-corr` 后编译下限变成 **Rust 1.89**(它的依赖 `wide`/`safe_arch` 要求),而默认功能是 1.88。
 
 ### 6.3 怎么写 Cargo.toml / 命令行临时开
@@ -404,7 +411,7 @@ Rust 的 `feature` 就是**编译时的可选开关**。库里写了很多代码
 ```toml
 # 永久:写进 Cargo.toml
 [dependencies]
-pixhunt = { version = "0.8", features = ["capture-dxgi", "match-corr", "parallel"] }
+pixhunt = { version = "0.9", features = ["capture-dxgi", "match-corr", "parallel"] }
 ```
 
 ```powershell
@@ -446,7 +453,7 @@ sudo apt-get install -y --no-install-recommends \
 | `Rect` | 一个矩形区域(限定查找范围用) | 不要 | 8.3 |
 | `PixelFormat` | 帧的通道顺序:`Rgba8` / `Bgra8` | 不要 | 8.3 |
 | `Capture`(trait) | "怎么拿到画面"的插座 | 不要 | 8.5 |
-| `XCapCapture` | 跨平台后端(xcap) | 不要 | 8.5 |
+| `XCapCapture` | 跨平台后端(xcap) | 〔f:capture-xcap〕默认开 | 8.5 |
 | `GdiCapture` | Windows GDI 后端 | 〔f:capture-gdi〕 | 8.5 |
 | `DxgiCapture` | Windows DXGI 后端(最快) | 〔f:capture-dxgi〕 | 8.5 |
 | `WindowCapture` | Windows 截单个窗口(PrintWindow) | 〔f:capture-window〕 | 8.5 |
@@ -718,6 +725,10 @@ if let Some(m) = finder.find_center_on_screen(&tpl)? {
 截一屏后与**上一次截图**对比,返回 `rect` 内颜色有差异的像素数量。
 
 - 首次调用(无基线)返回 `rect.width * rect.height`(视为"全部变了")。
+- **`rect` 是屏幕绝对坐标**,与当前 `region` 无关(和其他 `*_on_screen` 方法同口径)。
+  设了 `region` 且后端支持区域直抓时,库里拿到的是一张以 `region` 左上角为原点的局部
+  图,库会把 `rect` 换算到帧内再比。`rect` 落在本帧覆盖范围之外的部分不参与统计
+  (完全在帧外时返回 0,这不是错误)。
 - 比较 R/G/B 三通道(忽略 Alpha),任一通道不等就算"不同"。
 - 调用后当前帧成为下一次比较的基线。
 - **两次之间帧的布局变了**(用 `set_region` 换过区域大小、显示器分辨率被改、换了
@@ -729,6 +740,10 @@ if let Some(m) = finder.find_center_on_screen(&tpl)? {
   `diff_since_last_400x300_on_1080p` 实测 3.4 ms(改成复用之前是 5.6 ms),而这个数字里
   还含着基准用的假后端每次重新交出一份整帧的成本。真要密集轮询,给 `Finder` 设 `region`
   只抓那一块,比较和副本就都只按区域大小计。
+
+  这一条在 v0.8.2 及之前是坑:`rect` 没被换算到局部帧,任何原点非 (0,0) 的区域都会
+  被当成"在帧外"而永远返回 0(看着像"动画从不停"的反面:从来没变过)。现在坐标
+  换算已经修好,并且有回归测试看住。
 
 ```rust
 let changed = finder.diff_since_last(Rect::new(100, 100, 200, 50))?;
@@ -913,6 +928,10 @@ pub struct Template {
 - PNG 若含 alpha 通道且存在 `alpha == 0` 的像素,那些位置会被设为掩码跳过位
   (`RgbMatcher` 比较时忽略),不需要你手动处理。
 - 其他格式(BMP/GIF/TIFF)仍返回 `Err(Error::Image(..))`(见 11.4)。
+- **尺寸上限**:文件头声明的宽高超过 **4000 万像素**(约 6324x6324)时,`load` 会在
+  **真正解码之前**返回 `Err(Error::Image(ImageError::Limits(..)))`。这是为了挡"解压炸弹"——
+  几百 KB 的 PNG 在头里写个巨大尺寸,老代码会照着分配把内存打死;现在先只读文件头校验,
+  不超线才解码。正常找图用的模板远小于这个数,不会误伤。
 - 透明像素不会变成"忽略该区域"的掩码:非 alpha=0 的透明像素(alpha=1~254)
   仍参与比较,只是 RGB 值按实际存储使用。
 
@@ -1395,7 +1414,7 @@ pixhunt **不管鼠标**,点击交给生态库 [`enigo`](https://crates.io/crate
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.8", features = ["capture-dxgi"] }
+pixhunt = { version = "0.9", features = ["capture-dxgi"] }
 enigo = "0.6"
 ```
 
@@ -1557,7 +1576,7 @@ if let Some(b) = blobs.first() {
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.8", features = ["tracing"] }
+pixhunt = { version = "0.9", features = ["tracing"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 ```
@@ -1807,7 +1826,7 @@ cargo build --all-features
 能过就说明是 feature。把需要的写进 `Cargo.toml`:
 
 ```toml
-pixhunt = { version = "0.8", features = ["capture-dxgi", "match-corr"] }
+pixhunt = { version = "0.9", features = ["capture-dxgi", "match-corr"] }
 ```
 
 另一种典型:`error: expected 2 arguments` / 找不到 `Window` 变体 —— `CaptureKind::Window(..)`
@@ -1853,8 +1872,11 @@ GDI 后端在 `BitBlt` 或 `GetDIBits` 失败时返回 `Err`(见 8.5.3)。v0.8 �
 - 偶发一次:当作可重试的瞬时错误,下一帧再抓即可。
 - 持续失败:说明当前会话拿不到桌面(无人登录 / 会话被隔离),换 `CaptureKind::Auto`
   或 `Monitor` 也一样会失败,该修的是运行环境而不是代码。
-- 顺带注意:v0.8 起 `GdiCapture` 每次抓取前会检查桌面尺寸,变了就自行重建,不用你再重建
-  `Finder`(更早的版本会一直输出错位画面,表现为找图莫名全灭)。
+- 顺带注意:桌面尺寸变了(改分辨率 / 改缩放 / 切主显示器 / RDP 重连)时,`GdiCapture`
+  会自行重建位图,不用你再重建 `Finder`。但 **0.8.2 及更早**的版本在这条路径上有一个
+  顺序 bug:先读了旧尺寸才触发重建,于是一帧里 `Frame::width/height` 与 `pixels` 缓冲
+  **不是同一个尺寸** —— 旧代码拿旧尺寸去算行距,新尺寸更大时是一张静默错位的画面
+  (找图莫名全灭),新尺寸更小时按下标会读到缓冲之外。现在改成先重建、再取尺寸。
 
 ### 11.6 `capture error: DXGI desktop duplication unavailable`
 
@@ -2040,6 +2062,19 @@ pixhunt::template   Template
 
 ¹ `XCapCapture` 自己不会报"没变",但**设了 `region` 走区域直抓时**,`Finder` 会把这次
 的区域和上一帧逐字节比对来补齐这个信息(0.8.1 起);全屏路径无人代劳,每轮都算"变了"。
+
+**各后端到底抓哪一块屏**(多显示器时最容易踩):
+
+| 后端 | 选屏依据 | 能不能选别的屏 |
+| --- | --- | --- |
+| `GdiCapture` | `GetDC(NULL)` + `HORZRES/VERTRES` 的那一片(主显示器) | 不能;副屏与负坐标区不在画面里 |
+| `DxgiCapture` | `EnumAdapters(0)` + `EnumOutputs(0)` | 不能;多显卡(核显+独显)时这个顺序由驱动定,**不保证是主显示器** |
+| `XCapCapture`〔f:capture-xcap〕 | `primary()` 取主屏;`from_point(x, y)` 取坐标所在屏 | 能(唯一能按坐标选屏的全屏后端) |
+| `WindowCapture`〔f:capture-window〕 | 你递进来的 `HWND` | 能,且不受多屏影响(拿到的是客户区) |
+
+目标在副屏上、`region` 与坐标都写得对却一直找不到时,先怀疑你拿到的根本不是那块屏。
+(开 feature `tracing` 时只有 `region` 与画面**完全**不相交才会 warn 一次 —— 部分落在
+外面属正常情况,不响。)
 
 ### 12.6 仓库自带的三个示例
 

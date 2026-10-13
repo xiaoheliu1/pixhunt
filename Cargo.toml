@@ -1,6 +1,6 @@
 [package]
 name = "pixhunt"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2021"
 # resolver 3:生成 Cargo.lock 时按 MSRV 选兼容的依赖版本,而不是无脑拿最新,
 # 否则 rust-version 声明会被上游依赖的新版本悄悄推翻(见 CI 的 msrv job)。
@@ -15,8 +15,10 @@ categories = ["computer-vision", "multimedia::images", "os"]
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-# 跨平台保底截图后端(上游 screenshots 已停维,官方指向 xcap)
-xcap = "0.9.8"
+# 跨平台保底截图后端(上游 screenshots 已停维,官方指向 xcap)。
+# 可选:安卓等无截屏后端的平台用 default-features = false 剔除,只取匹配核心
+# (Frame/Template/RgbMatcher),帧像素由宿主(如 Kotlin MediaProjection)注入。
+xcap = { version = "0.9.8", optional = true }
 corrmatch = { version = "0.1", features = ["simd"], optional = true }
 rayon = { version = "1", optional = true }
 tracing = { version = "0.1", optional = true }
@@ -45,7 +47,9 @@ name = "match"
 harness = false
 
 [features]
-default = []
+# default 包含 capture-xcap:桌面用户的体验与 0.8.x 完全一致(非破坏性)。
+default = ["capture-xcap"]
+capture-xcap = ["dep:xcap"]
 capture-gdi = ["dep:windows"]
 capture-dxgi = ["dep:windows"]
 capture-window = ["dep:windows"]
