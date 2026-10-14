@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 use crate::frame::{Frame, Rect};
-use crate::template::Template;
+use crate::template::{Anchor, Template};
 
 /// 一次匹配结果:模板左上角落在 `(x, y)`。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -98,6 +98,16 @@ pub trait Matcher {
 ///
 /// 依据 [`Frame::rgb_offsets`] 自动适配 RGBA / BGRA 帧;模板恒为 RGB。开 feature
 /// `parallel` 时,`find`/`find_all` 用 rayon 按行分块并行(结果与串行完全一致)。
+///
+/// 预筛用的锚点在**模板构造时**就算好并存进 [`Template`],其字段说明在那里。它们
+/// 全是模板里未被掩的真实像素,按鉴别力降序排列,所以"锚点全过"始终是"整窗匹配"
+/// 的必要条件 —— 只可能白比几次,不可能漏掉真匹配。它们与容差无关,改 `tolerance` 不需要重算。
+///
+/// 为什么要把锚点排好、并且互相不同色:一次全屏查找的成本 ≈
+/// `扫描位置数 × 预筛取数` + `活过预筛的错候选数 × 整窗核对`。前者是**内存取数**
+/// 约束的(每个锚点落在屏幕不同行,基本等于一次 cache miss),所以靠"最高的那一枪
+/// 就把绝大多数错位置拒掉"来降;后者是大容差下的真正大头 —— 老的"中心+四角"在
+/// 横幅类模板上五个点读的是同一个底色,等于只有 1 个锚点在工作。
 ///
 /// [`find_all`](Matcher::find_all) 按 `(y, x)` 升序返回,重叠抑制是**按行增量**做的
 /// (代价与扫描同量级,不会在平坦画面上退化成二次方),并且 `max` 一到就**当场停止扫描**
@@ -461,16 +471,6 @@ impl RowDedup {
     }
 }
 
-/// 一个锚点采样:相对模板左上角的偏移 (sx, sy) 与该点的期望 RGB。
-#[derive(Clone, Copy)]
-struct Sample {
-    sx: usize,
-    sy: usize,
-    r: i32,
-    g: i32,
-    b: i32,
-}
-
 /// 一次扫描的预计算上下文(帧/模板/区域/锚点)。坐标均为绝对像素。
 struct Scan<'a> {
     px: &'a [u8],
@@ -481,7 +481,8 @@ struct Scan<'a> {
     th: usize,
     tw3: usize,
     thr: i32,
-    samples: Vec<Sample>,
+    /// 模板预置的锚点(已按分数降序)。空 = 全被掩,预筛恒过。
+    anchors: &'a [Anchor],
     mask: Option<&'a [bool]>,
     vbw: usize,
     vbh: usize,
@@ -503,64 +504,8 @@ impl<'a> Scan<'a> {
         }
         let tw3 = tw * 3;
         let mask = tpl.mask.as_deref();
-        // 重叠抑制用的宽/高:有掩码时取**可见像素的外接框**,无掩码(或全被掩掉,
-        // 此时退回旧行为)时等于整张模板尺寸。
-        let (vbw, vbh) = match mask {
-            None => (tw, th),
-            Some(m) => {
-                let (mut x0, mut y0) = (usize::MAX, usize::MAX);
-                let (mut x1, mut y1) = (0usize, 0usize);
-                for y in 0..th {
-                    for x in 0..tw {
-                        if m[y * tw + x] {
-                            x0 = x0.min(x);
-                            y0 = y0.min(y);
-                            x1 = x1.max(x);
-                            y1 = y1.max(y);
-                        }
-                    }
-                }
-                if x0 == usize::MAX {
-                    (tw, th)
-                } else {
-                    (x1 - x0 + 1, y1 - y0 + 1)
-                }
-            }
-        };
-        // 采样点:中心 + 四角(内缩以避开边缘抗锯齿),都是模板真实像素 ->
-        // "全部通过"是"整窗匹配"的必要条件,故预筛不会漏掉真匹配。
-        // 有掩码时只选"未被掩掉"的锚点。
-        let inset_x = 2.min(tw / 2);
-        let inset_y = 2.min(th / 2);
-        let cx = tw / 2;
-        let cy = th / 2;
-        let pts = [
-            (cx, cy),
-            (inset_x, inset_y),
-            (tw - 1 - inset_x, inset_y),
-            (inset_x, th - 1 - inset_y),
-            (tw - 1 - inset_x, th - 1 - inset_y),
-        ];
-        let mut samples: Vec<Sample> = Vec::with_capacity(pts.len());
-        for (sx, sy) in pts {
-            // 跳过被掩码标记为不参与比较的锚点
-            if let Some(m) = mask {
-                if !m[sy * tw + sx] {
-                    continue;
-                }
-            }
-            let i = sy * tw3 + sx * 3;
-            let s = Sample {
-                sx,
-                sy,
-                r: tpl.rgb[i] as i32,
-                g: tpl.rgb[i + 1] as i32,
-                b: tpl.rgb[i + 2] as i32,
-            };
-            if !samples.iter().any(|e| e.sx == s.sx && e.sy == s.sy) {
-                samples.push(s);
-            }
-        }
+        // 重叠抑制用的宽/高与预筛锚点都在模板构造时算好了,这里只读(见 [`Template`])。
+        let (vbw, vbh) = tpl.visible_box;
         Some(Scan {
             px: &frame.pixels,
             tpl: &tpl.rgb,
@@ -570,7 +515,7 @@ impl<'a> Scan<'a> {
             th,
             tw3,
             thr,
-            samples,
+            anchors: &tpl.anchors,
             mask,
             vbw,
             vbh,
@@ -611,11 +556,15 @@ impl<'a> Scan<'a> {
         }
     }
 
-    /// 多锚点预筛:所有采样点的对应屏幕像素都需在容差内才继续。
+    /// 多锚点预筛:所有锚点的对应屏幕像素都需在容差内才继续整窗核对。
+    ///
+    /// `self.anchors` 已按鉴别力降序排好,配合下面的逐个 `return false`,
+    /// 绝大多数错位置在第一枪就被拒 —— 这就是排序的全部意义(预筛的代价是
+    /// 按位置算的内存取数,不是比较次数)。
     #[inline(always)]
     fn anchor_ok(&self, y0: usize, x0: usize) -> bool {
         let (ro, go, bo) = self.off;
-        for s in &self.samples {
+        for s in self.anchors {
             let p = (y0 + s.sy) * self.sw4 + s.sx * 4 + x0 * 4;
             if (self.px[p + ro] as i32 - s.r).abs() > self.thr
                 || (self.px[p + go] as i32 - s.g).abs() > self.thr
@@ -1242,5 +1191,205 @@ mod tests {
         let m = RgbMatcher::new(0).find(&frame, &t);
         // 全掩时没有锚点可筛,verify 全跳过 → 第一个位置就通过
         assert!(m.is_some(), "全掩模板应给出命中(语义:不需要比较任何像素)");
+    }
+
+    // ==================== 预筛锚点(与 Template 里的选取配合) ====================
+
+    /// 从帧里裁一块当模板(RGB 顺序)。裁出来的是帧上真实的纹理,比纯色块更像真场景。
+    fn cut_tpl(frame: &Frame, tx: usize, ty: usize, tw: usize, th: usize) -> Vec<u8> {
+        let mut rgb = Vec::with_capacity(tw * th * 3);
+        for y in ty..ty + th {
+            for x in tx..tx + tw {
+                let i = (y * frame.width + x) * 4;
+                rgb.extend_from_slice(&[frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2]]);
+            }
+        }
+        rgb
+    }
+
+    /// 零漏检不变量:在真匹配处,模板里所有未被掩的像素都与帧一致,所以**任意一组**
+    /// 合法锚点都必须全部通过。这里按容差逐档直接问 `candidate_at`(不走"第一命中
+    /// 即停"的扫描),就是为了把"大容差下前面先撞到一个假候选"这件事与"漏检"分开。
+    #[test]
+    fn true_match_survives_prefilter_at_every_tolerance() {
+        let (w, h) = (96usize, 72usize);
+        let px = gradient(w, h);
+        let frame = Frame::rgba8(w, h, px);
+        let (tw, th) = (40usize, 16usize);
+        for tol in [0i32, 1, 10, 25, 40, 64] {
+            // 无掩码:模板就是从同一张帧上裁下来的,真位置在 (8, 30)。
+            let tpl = Template::from_rgb(cut_tpl(&frame, 8, 30, tw, th), tw, th);
+            let s = Scan::new(&frame, &tpl, tol, frame.full_rect()).expect("区域足够");
+            assert!(s.anchor_ok(30, 8), "tol={tol} 真匹配处必须过预筛");
+            assert!(s.candidate_at(30, 8), "tol={tol} 真匹配处必须命中");
+
+            // 带掩码:同样必须命中,而且锚点一个都不能落在被掩区里。
+            let mask: Vec<bool> = (0..th * tw).map(|i| i % 7 != 0).collect();
+            let tmask =
+                Template::from_rgb(cut_tpl(&frame, 8, 30, tw, th), tw, th).with_mask(mask.clone());
+            for a in &tmask.anchors {
+                assert!(
+                    mask[a.sy * tw + a.sx],
+                    "tol={tol} 锚点落在被掩区: {:?}",
+                    (a.sx, a.sy)
+                );
+            }
+            let s = Scan::new(&frame, &tmask, tol, frame.full_rect()).unwrap();
+            assert!(s.candidate_at(30, 8), "tol={tol} 带掩码的真匹配处必须命中");
+        }
+    }
+
+    /// 改动前那套"中心+四角"的取点公式,原样搬过来做参照。
+    fn legacy_points(tw: usize, th: usize) -> Vec<(usize, usize)> {
+        let ix = 2.min(tw / 2);
+        let iy = 2.min(th / 2);
+        let pts = [
+            (tw / 2, th / 2),
+            (ix, iy),
+            (tw - 1 - ix, iy),
+            (ix, th - 1 - iy),
+            (tw - 1 - ix, th - 1 - iy),
+        ];
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for p in pts {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// 预筛放过多少个位置(只数锚点,不 verify)。口径与 [`Scan::anchor_ok`] 一致。
+    fn pass_count(
+        frame: &Frame,
+        anchors: &[(usize, usize, i32, i32, i32)],
+        thr: i32,
+        x_hi: usize,
+        y_hi: usize,
+    ) -> usize {
+        let (ro, go, bo) = frame.rgb_offsets();
+        let stride = frame.width * 4;
+        let mut n = 0usize;
+        for y0 in 0..y_hi {
+            for x0 in 0..x_hi {
+                if anchors.iter().all(|&(sx, sy, r, g, b)| {
+                    let p = (y0 + sy) * stride + (x0 + sx) * 4;
+                    (frame.pixels[p + ro] as i32 - r).abs() <= thr
+                        && (frame.pixels[p + go] as i32 - g).abs() <= thr
+                        && (frame.pixels[p + bo] as i32 - b).abs() <= thr
+                }) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// 这一条是本轮优化的核心证据,而且不需要真机:同一张帧、同一模板、同一容差,
+    /// 只把锚点集从"中心+四角"换成模板自己选出来的一组,看预筛放过的位置数。
+    ///
+    /// 场景就是那个让人踩坑的形状:满屏都是横幅底色,模板的中心与四角也全落在底色上。
+    /// 老的那 5 个点读的是同一个颜色,所以在整片底色上全部通过 —— 预筛形同虚设,
+    /// 每个位置都要跑一次整窗核对(模板越大越贵)。
+    #[test]
+    fn decorrelated_anchors_reject_far_more_false_positions() {
+        let (fw, fh) = (240usize, 120usize);
+        let bg = [30i32, 90, 160];
+        let mark = [240i32, 240, 60];
+        let mut px = vec![0u8; fw * fh * 4];
+        for ch in px.chunks_mut(4) {
+            ch[0] = bg[0] as u8;
+            ch[1] = bg[1] as u8;
+            ch[2] = bg[2] as u8;
+            ch[3] = 255;
+        }
+        // 模板:底色 + 两块标记,中心/四角都在底色上(与 template.rs 的 banner_tpl 同构)。
+        let (tw, th) = (60usize, 20usize);
+        let mut tpl_rgb = vec![0u8; tw * th * 3];
+        for ch in tpl_rgb.chunks_mut(3) {
+            ch.copy_from_slice(&[bg[0] as u8, bg[1] as u8, bg[2] as u8]);
+        }
+        let stamp = |buf: &mut Vec<u8>, bw: usize, x0: usize, y0: usize, c: [i32; 3]| {
+            for y in y0..y0 + 2 {
+                for x in x0..x0 + 4 {
+                    let i = (y * bw + x) * 3;
+                    buf[i] = c[0] as u8;
+                    buf[i + 1] = c[1] as u8;
+                    buf[i + 2] = c[2] as u8;
+                }
+            }
+        };
+        stamp(&mut tpl_rgb, tw, 10, 10, mark);
+        stamp(&mut tpl_rgb, tw, 44, 6, mark);
+        // 把模板原样贴到帧上 (100,50),再在 (20,20) 撒几颗零星标记点。
+        for y in 0..th {
+            for x in 0..tw {
+                let i = ((50 + y) * fw + (100 + x)) * 4;
+                px[i] = tpl_rgb[(y * tw + x) * 3];
+                px[i + 1] = tpl_rgb[(y * tw + x) * 3 + 1];
+                px[i + 2] = tpl_rgb[(y * tw + x) * 3 + 2];
+            }
+        }
+        for (x, y) in [(20usize, 20usize), (21, 20), (30, 90)] {
+            let i = (y * fw + x) * 4;
+            px[i] = mark[0] as u8;
+            px[i + 1] = mark[1] as u8;
+            px[i + 2] = mark[2] as u8;
+        }
+        let frame = Frame::rgba8(fw, fh, px);
+        let tpl = Template::from_rgb(tpl_rgb, tw, th);
+        let thr = 40i32;
+        let (x_hi, y_hi) = (fw - tw + 1, fh - th + 1);
+
+        let legacy: Vec<(usize, usize, i32, i32, i32)> = legacy_points(tw, th)
+            .into_iter()
+            .map(|(sx, sy)| {
+                let i = (sy * tw + sx) * 3;
+                (
+                    sx,
+                    sy,
+                    tpl.rgb[i] as i32,
+                    tpl.rgb[i + 1] as i32,
+                    tpl.rgb[i + 2] as i32,
+                )
+            })
+            .collect();
+        // 先坐实前提:老的那几个点颜色全相同,等于只有 1 个锚点在工作。
+        assert!(
+            legacy
+                .windows(2)
+                .all(|w| (w[0].2, w[0].3, w[0].4) == (w[1].2, w[1].3, w[1].4)),
+            "构造失效:老的参照锚点应当同色,实际 {legacy:?}"
+        );
+        let new: Vec<(usize, usize, i32, i32, i32)> = tpl
+            .anchors
+            .iter()
+            .map(|a| (a.sx, a.sy, a.r, a.g, a.b))
+            .collect();
+        let n_legacy = pass_count(&frame, &legacy, thr, x_hi, y_hi);
+        let n_new = pass_count(&frame, &new, thr, x_hi, y_hi);
+        // 真匹配处仍在(否则这条测试自己就是漏检),而预筛放过的总数大幅下跌。
+        assert!(n_new > 0, "新锚点集若一个都不放过,说明构造不对");
+        assert!(
+            n_new * 20 < n_legacy,
+            "新锚点预筛放过的位置数应远低于老的 5 点同色参照,实际 {n_new} vs {n_legacy}"
+        );
+    }
+
+    /// 1×1 模板:带子塌成单点,仍要能端到端命中。
+    #[test]
+    fn single_pixel_template_hits() {
+        let (w, h) = (32usize, 24usize);
+        let mut px = gradient(w, h);
+        let tpl = paste_block(&mut px, w, h, 17, 11, 1, [99, 33, 77]);
+        let frame = Frame::rgba8(w, h, px);
+        let t = Template::from_rgb(tpl, 1, 1);
+        assert_eq!(t.anchors.len(), 1, "1×1 只可能有一个锚点");
+        let m = RgbMatcher::new(0).find(&frame, &t).expect("1×1 应命中");
+        // 1×1 意味着"屏幕上是这个颜色的第一个位置"就算命中,不关心具体坐标。
+        assert_eq!(
+            t.rgb[0] as i32,
+            frame.pixels[(m.y as usize * w + m.x as usize) * 4] as i32
+        );
     }
 }

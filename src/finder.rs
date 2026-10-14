@@ -11,6 +11,15 @@ use crate::Result;
 
 use std::time::{Duration, Instant};
 
+/// 长轮询的进度播报节奏:每等满这么久打一条 `op = "poll_progress"` 的 trace
+/// (要 feature `tracing`)。定 5 秒的理由:短到"它还在转"这件事不用等太久才能确认,
+/// 长到一次正常等待(几百毫秒到几秒)不会被刷屏。
+///
+/// 没拿 `#[cfg(feature = "tracing")]` 括住是因为两个公开入口**无条件**把它传给
+/// [`Finder::poll`](那个参数长什么样见它自己的注释);括上它就得在调用点再套一层 cfg。
+/// 关掉 feature 时它只是个没人看的常量,不占也不花什么。
+const POLL_PROGRESS: Duration = Duration::from_secs(5);
+
 #[cfg(all(windows, feature = "capture-dxgi"))]
 use crate::Error;
 
@@ -215,15 +224,24 @@ impl Finder {
     /// 仍未出现返回 `Ok(None)`。自动化脚本"等按钮出现"的标准姿势,配合后端的
     /// 静态帧跳过(以及区域直抓时的帧比对),等待期间开销极小。
     ///
-    /// `timeout` 大到没法加进当前时刻(典型入参 `Duration::MAX`)时视为**永不超时**,
-    /// 不会 panic。
+    /// `timeout` **没有任何上限**,你写多久就等多久:
+    /// - 大到加不进当前时刻的值(典型入参 [`Duration::MAX`])视为**永不超时**,不会 panic;
+    /// - [`Duration::ZERO`] 是**只看一眼**——仍会截一帧、找一次,没命中就立刻返回 `None`。
+    ///
+    /// ⚠️ 一旦进来就**没有中途叫停的通道**:只有"命中""到点""截图报错"三个出口,期间
+    /// 既没有回调也读不到任何外部标志(想按个键就收手、想让取消生效,这里做不到)。
+    /// 等得又久又要能随时停,就别用它:自己拿 [`Finder::find_on_screen`] 组循环,每圈去问
+    /// 你自己的条件(截图失败照样是 `Err`,和这里同口径)。
+    ///
+    /// 等待过程的可见性:开 feature `tracing` 时,每等满 5 秒会多一条
+    /// `op = "poll_progress"` 的 trace(已等了多久、拍了几次);不开 feature 甚至一条也不输出。
     pub fn find_until(
         &mut self,
         tpl: &Template,
         timeout: Duration,
         interval: Duration,
     ) -> Result<Option<Match>> {
-        let m = self.poll(tpl, timeout, interval, true)?;
+        let m = self.poll(tpl, timeout, interval, true, POLL_PROGRESS)?;
         px_trace!(
             op = "find_until",
             result = if m.is_some() { "hit" } else { "timeout" },
@@ -235,14 +253,16 @@ impl Finder {
     /// 轮询等待模板**消失**:在 `timeout` 内找不到即返回 `Ok(true)`,超时仍能找到
     /// 返回 `Ok(false)`(如等加载遮罩消失、等按钮置灰图标下屏)。
     ///
-    /// 同 [`Finder::find_until`]:超大的 `timeout`(如 `Duration::MAX`)视为永不超时。
+    /// 同 [`Finder::find_until`]:超大的 `timeout`(如 `Duration::MAX`)视为永不超时,
+    /// `Duration::ZERO` 是只看一眼(仍会拍一次,还在 = `false`,不见了 = `true`);
+    /// 同样**没有中途叫停的通道**,想能停就自己组循环;开 `tracing` 时同样是每 5 秒一条进度。
     pub fn wait_gone(
         &mut self,
         tpl: &Template,
         timeout: Duration,
         interval: Duration,
     ) -> Result<bool> {
-        let hit = self.poll(tpl, timeout, interval, false)?;
+        let hit = self.poll(tpl, timeout, interval, false, POLL_PROGRESS)?;
         px_trace!(
             op = "wait_gone",
             result = if hit.is_none() { "gone" } else { "still_present" },
@@ -255,20 +275,52 @@ impl Finder {
     ///
     /// 溢出**不当成错误也不截断成 0**,而是当成"不设截止点"——"我就一直等"是合法写法,
     /// 库不该用一个合法的 `Duration` 把调用方当场炸掉(`Instant + Duration` 溢出会 panic)。
+    ///
+    /// ★ 不设截止点就意味着这个循环可能永远转下去,而它**不检查任何外部取消条件**
+    ///   (库拿不到调用方的意图,这是 API 的边界不是实现没写完)。能做的只有让它
+    ///   "看得见还在转":每满 `progress_every` 打一条 trace(公开入口传的是
+    ///   [`POLL_PROGRESS`] = 5 秒)。要真能中断,调用方自己
+    ///   拿 [`Finder::find_on_screen`] 组循环,不要把长等待交给这里。
+    ///
+    /// 阈值是个入参而不是直接读常量,为的是能【当场验】那条 trace 真发得出来:
+    /// 留在常量里就得让测试真跑满 5 秒。
     fn poll(
         &mut self,
         tpl: &Template,
         timeout: Duration,
         interval: Duration,
         want_hit: bool,
+        progress_every: Duration,
     ) -> Result<Option<Match>> {
-        let deadline = Instant::now().checked_add(timeout);
+        // 不开 tracing 时这个参数没人看,拿一下免得报"参数未使用"。
+        #[cfg(not(feature = "tracing"))]
+        let _ = progress_every;
+        let started = Instant::now();
+        let deadline = started.checked_add(timeout);
+        // 下面这两只是给"每 progress_every 一条进度"记账的:不开 tracing 时整块不参与编译,
+        // 连轮次计数和时间比较都不存在,最常见的路径上是真零成本。
+        #[cfg(feature = "tracing")]
+        let (mut tries, mut last_progress) = (0u64, started);
         loop {
             let m = self.find_on_screen(tpl)?;
             if m.is_some() == want_hit {
                 return Ok(m);
             }
             let now = Instant::now();
+            #[cfg(feature = "tracing")]
+            {
+                tries += 1;
+                // 等待可以很长,但不能让人分不清"还在转"和"已经卡死"。
+                if now.duration_since(last_progress) >= progress_every {
+                    px_trace!(
+                        op = "poll_progress",
+                        want_hit = want_hit,
+                        waited_ms = now.duration_since(started).as_millis() as u64,
+                        tries = tries,
+                    );
+                    last_progress = now;
+                }
+            }
             if let Some(deadline) = deadline {
                 if now >= deadline {
                     return Ok(m);
@@ -675,6 +727,8 @@ mod tests {
 
     use std::cell::Cell;
     use std::rc::Rc;
+    #[cfg(feature = "tracing")]
+    use std::sync::{Arc, Mutex};
 
     const W: usize = 32;
     const H: usize = 32;
@@ -719,6 +773,80 @@ mod tests {
         Template::from_rgb([255, 0, 0].repeat(8 * 8), 8, 8)
     }
 
+    /// 只关心"被拍了多少次"的 mock。用它钉【次数】而不是结果:
+    /// "只看一眼"写进文档了,那循环三圈再返回 None 就是违约,而光看返回值看不出来。
+    struct CountCap {
+        target: bool,
+        grabs: Rc<Cell<usize>>,
+    }
+
+    impl Capture for CountCap {
+        fn grab(&mut self) -> Result<Frame> {
+            self.grabs.set(self.grabs.get() + 1);
+            Ok(frame(self.target))
+        }
+
+        fn backend(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    fn counter_cap(target: bool) -> (Box<dyn Capture>, Rc<Cell<usize>>) {
+        let n = Rc::new(Cell::new(0));
+        (
+            Box::new(CountCap {
+                target,
+                grabs: n.clone(),
+            }),
+            n,
+        )
+    }
+
+    /// 只把事件里的 `op` 字段记下来的假订阅器。它**不多一个依赖**(库里本来就带着
+    /// `tracing`),为的是把"进度日志真发得出来"这件事从推断变成看过。
+    #[cfg(feature = "tracing")]
+    struct EventLog(Arc<Mutex<Vec<String>>>);
+
+    #[cfg(feature = "tracing")]
+    impl tracing::Subscriber for EventLog {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            // 本测试不开 span,给个占位号就行。
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Pick(Option<String>);
+            impl tracing::field::Visit for Pick {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "op" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut pick = Pick(None);
+            event.record(&mut pick);
+            if let Some(op) = pick.0 {
+                self.0.lock().unwrap().push(op);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
     fn finder_with(present: Vec<bool>) -> Finder {
         Finder::new(
             Box::new(SeqCapture { present, grabs: 0 }),
@@ -751,6 +879,63 @@ mod tests {
             )
             .expect("mock 不会出错");
         assert!(m.is_none(), "一直找不到应在超时后返回 None");
+    }
+
+    /// 文档承诺 `Duration::ZERO` 是"只看一眼"。数的是【截了几次屏】:一眼与三眼都
+    /// 返回 None,不看次数就钉不住这条。间隔给的是 5 毫秒,循环多转一圈就会多一拍。
+    #[test]
+    fn zero_timeout_looks_exactly_once() {
+        let (cap, n) = counter_cap(false);
+        let mut f = Finder::new(cap, Box::new(RgbMatcher::new(0)));
+        let m = f
+            .find_until(&target_tpl(), Duration::ZERO, Duration::from_millis(5))
+            .expect("mock 不会出错");
+        assert!(m.is_none(), "屏幕上没目标,看一眼就该是 None");
+        assert_eq!(
+            n.get(),
+            1,
+            "timeout=ZERO 只能拍一帧;多拍的那几帧就是把\"看一眼\"悄悄变成了\"等一会儿\""
+        );
+    }
+
+    /// 同一件事在等消失那一侧:目标就在屏上,看一眼就该答"还在"(false),
+    /// 而不是去睡下一个 interval 再看第二眼。
+    #[test]
+    fn zero_timeout_wait_gone_asks_once() {
+        let (cap, n) = counter_cap(true);
+        let mut f = Finder::new(cap, Box::new(RgbMatcher::new(0)));
+        let gone = f
+            .wait_gone(&target_tpl(), Duration::ZERO, Duration::from_millis(5))
+            .expect("mock 不会出错");
+        assert!(!gone, "目标就在屏上,\"不见了\"只能是假");
+        assert_eq!(n.get(), 1, "同理:只看一眼");
+    }
+
+    /// 上一轮只能证明"开了 feature 能编译",这条证明**真收得到**:阈值压到 2 毫秒、
+    /// 预算 30 毫秒,当场就该看到 `poll_progress`。装的是本文件那个假订阅器,没加依赖。
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn poll_progress_really_emits() {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let (cap, _n) = counter_cap(false);
+        let mut f = Finder::new(cap, Box::new(RgbMatcher::new(0)));
+        tracing::subscriber::with_default(EventLog(ops.clone()), || {
+            f.poll(
+                &target_tpl(),
+                Duration::from_millis(30),
+                Duration::from_millis(1),
+                true,
+                Duration::from_millis(2),
+            )
+            .expect("mock 不会出错");
+        });
+        let got = ops.lock().unwrap().clone();
+        // 比的是【全等】而不是包含:"poll_progress_x" 也算 contains,那样这条测试
+        // 对名字完全不敏感(实测把 op 改坏也照样绿),就退化成"发了点东西"而不是"发了这条"。
+        assert!(
+            got.iter().any(|o| o.trim_matches('"') == "poll_progress"),
+            "等了 30 毫秒、进度阈值 2 毫秒,却一条 poll_progress 也没收到(实际收到: {got:?})"
+        );
     }
 
     #[test]

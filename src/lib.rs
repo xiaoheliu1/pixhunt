@@ -18,7 +18,8 @@
 //! 变化检测 [`Finder::diff_since_last`]。
 //! 模板支持透明掩码 `Template::mask`(跳过指定像素不比较)。
 //! 开 feature `parallel` 可用 rayon 加速(`RgbMatcher` 按行并行、ZNCC 分层并行);
-//! 开 `tracing` 输出 trace 级诊断事件(截图耗时、缓存跳过、命中与否),排查"为什么找不到"。
+//! 开 `tracing` 输出 trace 级诊断事件(截图耗时、缓存跳过、命中与否、长轮询每 5 秒一条
+//! 进度),排查"为什么找不到"。
 //!
 //! ```no_run
 //! # #[cfg(feature = "capture-xcap")] { // CaptureKind::Monitor 需要 xcap 后端;关掉时整段编成空 main。

@@ -53,7 +53,7 @@ pixhunt 做的事只有一件:
 | 只在屏幕右下角这一块找(更快) | `Finder::builder().region(...)` / `set_region` | 8.1、8.2 |
 | 屏幕上有好几个一样的图标,全找出来 | `Finder::find_all_on_screen` | 8.1 |
 | 一次截图同时找 5 个不同的图 | `Finder::find_many_on_screen` | 8.1 |
-| 等一个按钮出现(最多等 10 秒) | `Finder::find_until` | 8.1 |
+| 等一个按钮出现(等多久由你写,没有上限) | `Finder::find_until` | 8.1 |
 | 等一个加载遮罩消失 | `Finder::wait_gone` | 8.1 |
 | 找"红色像素连成的一坨"(血条、状态灯),没有图怎么办 | `Finder::find_color_on_screen` | 8.8 |
 | 只截某个窗口(被别的东西挡住也能截) | `WindowCapture` | 8.5 |
@@ -120,14 +120,14 @@ myhunter/
 
 ```toml
 [dependencies]
-pixhunt = "0.9"
+pixhunt = "0.10"
 ```
 
 想用 Windows 上更快的截图后端或更强的算法,就开对应"功能开关"(第 6 章详解):
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.9", features = ["capture-dxgi", "capture-gdi", "capture-window", "match-corr", "parallel"] }
+pixhunt = { version = "0.10", features = ["capture-dxgi", "capture-gdi", "capture-window", "match-corr", "parallel"] }
 ```
 
 改完保存。**不需要手动下载**,第一次运行 `cargo run` 时 Cargo 会自动联网抓依赖。
@@ -411,7 +411,7 @@ Rust 的 `feature` 就是**编译时的可选开关**。库里写了很多代码
 ```toml
 # 永久:写进 Cargo.toml
 [dependencies]
-pixhunt = { version = "0.9", features = ["capture-dxgi", "match-corr", "parallel"] }
+pixhunt = { version = "0.10", features = ["capture-dxgi", "match-corr", "parallel"] }
 ```
 
 ```powershell
@@ -641,13 +641,21 @@ if rs[0].is_some() { println!("当前在主页"); }
 
 - 命中不算超时:哪怕只剩 1 毫秒,查到就返回 `Some`。
 - `interval` 不会被睡过头:最后一轮会取 `min(interval, 剩余时间)`。
-- 想"一直等下去"可以直接传 `Duration::MAX`(或 `from_secs(u64::MAX)`):库里用
+- **`timeout` 没有任何上限**,写多久就等多久(库不会把你写的 5 分钟静默夹成 1 分钟):
+  想"一直等下去"可以直接传 `Duration::MAX`(或 `from_secs(u64::MAX)`)——库里用
   `checked_add` 算截止时刻,算不出来就当**永不超时**,不会 panic。v0.8.0 之前这里会
   在 `Instant::now() + timeout` 溢出时当场 panic。
+- `Duration::ZERO` 是**只看一眼**:仍会截一帧、找一次,没命中就立刻返回 `None`。
+  `interval` 传 `ZERO` 则是"圈与圈之间不额外睡",节流全靠截图本身耗时。
+- ⚠️ **一旦进来就没有中途叫停的通道**:只有"命中""到点""截图报错"三个出口,期间
+  既没有回调也读不到任何外部标志。等 10 秒无所谓,等 1 小时就是把自己关在里面。
+  要"等很久又能随时收手",别用它——自己拿 `find_on_screen` 组循环,每圈去问你自己的条件。
 - 等待期间每轮都会截图,但**画面没变就不会重新搜索**(见 8.1.3 的缓存跳过):
   `Dxgi` 后端自己上报,或者你设了 `region` 且后端支持区域直抓时库里逐字节比对。
   其余情况(静态画面 + `Monitor`/`Gdi`/`Window` + 全屏)每轮都是真截图 + 真搜索,
   想省 CPU 就把 `interval` 设大点。
+- 等得久时想确认它还在转:开 feature `tracing`,每等满 5 秒会多一条
+  `op = "poll_progress"` 的 trace(已等了多久、拍了几次)。
 
 ```rust
 use std::time::Duration;
@@ -662,7 +670,9 @@ let m = finder.find_until(&tpl, Duration::MAX, Duration::from_millis(200))?; // 
 - `Ok(true)`:在 `timeout` 内确实找不到了(等待成功)。
 - `Ok(false)`:到时间了还在(比如加载遮罩一直转)。
 - 语义与 `find_until` 相反,注意别搞混:**它返回 `bool` 而不是 `Option<Match>`**。
-- 超时参数同样允许 `Duration::MAX`(视为永不超时,不会 panic),缓存/轮询行为见 8.1.6。
+- 超时参数同样没有上限,`Duration::MAX` 视为永不超时、`Duration::ZERO` 是只看一眼
+  (还在 = `false`,不见了 = `true`)。同样**没有中途叫停的通道**;开 `tracing` 时
+  也是每 5 秒一条 `poll_progress`。缓存/轮询行为见 8.1.6。
 
 典型用途:等"正在保存…"的提示条不见了再继续下一步。
 
@@ -919,6 +929,12 @@ pub struct Template {
 `mask` 为 `None` 时全部像素参与比较(向后兼容)。从含 alpha 通道的 PNG 加载时,
 `alpha == 0` 的像素会被自动标记为 `false`(不参与比较)。
 
+⚠️ **上面不是结构体的全部**:v0.10 起 `Template` 内部还有两个预计算字段(预筛
+锚点表与可见区外接框)。它们不对外可见,但足以让
+`Template { rgb, width, height, mask }` 这种**结构体字面量构造编不过**。改走工厂方法
+就行:`Template::from_rgb(...)` / `Template::from_rgba(...)` / `Template::load(...)`。
+读字段(`tpl.width` 等)不受影响。
+
 #### 8.4.2 `Template::load(path: impl AsRef<Path>) -> Result<Self>`
 
 从图片文件读模板,内部转成 RGB(透明通道被丢掉或变成掩码)。
@@ -940,6 +956,12 @@ let tpl = Template::load("D:/pic/button.png")?;
 let tpl2 = Template::load(std::path::PathBuf::from("button.png"))?;
 ```
 
+一次性的构造成本:`load` / `from_rgb` / `from_rgba` 顺手把预筛锚点算好(见 8.6.2),
+代价与模板面积成正比。常规尺寸的图标是微秒量级;上限那张 4000 万像素的模板也只做
+一次,而且候选池会等间隔子采样到 25 万个点以内,不会变成几百毫秒。
+**反复找同一张图不需要再付这笔钱** —— 自己缓存 `Template`(或 `Arc<Template>`),
+不要每次找图都 `load` 一遍。
+
 #### 8.4.3 `Template::from_rgb` / `from_rgba` / `with_mask`
 
 ```rust
@@ -951,6 +973,9 @@ pub fn with_mask(self, mask: Vec<bool>) -> Self   // builder-style
 - `from_rgb`:从内存里的 RGB 字节造模板(无掩码,全部像素参与比较)。
 - `from_rgba`:从 RGBA 字节造模板,`alpha == 0` 的像素自动变成掩码跳过位。
 - `with_mask`:在已有模板上手动指定掩码(链式调用);`mask.len() == width * height`。
+  ★ 它会**重算**锚点与可见外接框:锚点必须是"还参与比较的像素",否则它会拿一个已经
+  被掩掉的像素的颜色去要求屏幕,那就是真的漏检。构造完再 `with_mask` 是公开写法,不是边角。
+  代价同样与面积成正比,一次而已。
 
 ⚠️ `from_rgb` 内部有 `assert_eq!(rgb.len(), width * height * 3)`,长度不对**直接 panic**。
 `from_rgba` 同理(`width * height * 4`)。从别处搬来的字节先确认长度。
@@ -1203,8 +1228,16 @@ impl RgbMatcher { pub fn new(tolerance: i32) -> Self }
 
 工作原理(理解了这个就知道它为什么快、什么时候会翻车):
 
-1. 在模板里取**最多 5 个锚点**(中心 + 四角,内缩 2 像素躲开抗锯齿)。
-2. 对每个候选位置先比这 5 个点(全在容差内才继续)——绝大多数位置在这一步就被否掉。
+1. 在模板**构造时**就挑好一组预筛锚点并存进 `Template`(3~12 个,个数按可见区面积
+   反推、以旧版的 5 个为地板)。选点只三条硬规矩:① 必须是模板里**未被掩**的真实像
+   素(所以"锚点全过"永远是"整窗匹配"的必要条件,不可能误杀真命中);② 按"局部对比
+   度 + 颜色稀有度"打分排序;③ 尽量落在不同网格、且互相不同色。位置与颜色都和容差无
+   关,所以改 `tolerance` 不会重算。
+   旧版是固定取"中心 + 四角"5 个点(内缩 2 像素):横幅类模板上这 5 个点读的是同一
+   片底色,等于只有 1 个锚点在工作;而 5×5 这类小模板上 5 个点会重合,实际只剩 1 个。
+2. 对每个候选位置先比这些点(全在容差内才继续),而且**从分数最高的那个开始**。预筛的
+   代价是按位置算的**内存取数**(每个锚点落在屏幕不同行,基本等于一次 cache miss),
+   不是比较次数 —— 所以值钱的是"第一枪就把绝大多数错位置否掉",不是点数多。
 3. 锚点过了再**逐像素整窗验证**,一遇超差立刻退出(早失败)。
 4. 全程不做灰度转换、不重排通道,通过 `Frame::rgb_offsets()` 直接按帧格式取字节。
 
@@ -1216,7 +1249,9 @@ impl RgbMatcher { pub fn new(tolerance: i32) -> Self }
   用 `find_all(tpl, 2)`(见 8.1.3、8.6.1)。
 - ⚠️ **退化场景**:如果模板和搜索区域**都几乎是单色**(方差极低),锚点预筛几乎筛不掉任何东西,
   早失败也失效——1080p + 64px 模板实测会从 ~3ms 退化到 **~1.9 秒**。
-  避免办法:模板不要从纯色区裁;真要纯色请用颜色搜索(8.8)或 `Corr`(但它也怕零方差)。
+  模板自己就是单色时,任何选点法都拿不到"不同色"的锚点(64×64 的面积只给 5 个点,与旧版
+  同数),所以这一条不受锚点自适应的影响。避免办法:模板不要从纯色区裁;真要纯色请用颜色搜索(8.8)
+  或 `Corr`(但它也怕零方差)。
 
 `find_all` 的去重规则见 8.1.4。它按 `(y, x)` 顺序扫描,并对每一行**增量**判断"这个候选
 是否已被更早保留的命中盖住"(只与 y 方向相差小于模板高度的那些保留项冲突,配一个滑动的
@@ -1414,7 +1449,7 @@ pixhunt **不管鼠标**,点击交给生态库 [`enigo`](https://crates.io/crate
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.9", features = ["capture-dxgi"] }
+pixhunt = { version = "0.10", features = ["capture-dxgi"] }
 enigo = "0.6"
 ```
 
@@ -1569,14 +1604,15 @@ if let Some(b) = blobs.first() {
 
 ### 9.8 "为什么找不到?"——开 tracing 看内部发生了什么
 
-库内置了 trace 级诊断事件(后端名、帧尺寸、截图/搜索耗时、是否命中、有没有走缓存)。
+库内置了 trace 级诊断事件(后端名、帧尺寸、截图/搜索耗时、是否命中、有没有走缓存,
+以及**长轮询每 5 秒一条 `op = "poll_progress"`** —— 等很久时靠它区分"还在转"和"卡死了")。
 需要两步:开 feature + 你在自己程序里装一个"订阅器"。
 
 `Cargo.toml`:
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.9", features = ["tracing"] }
+pixhunt = { version = "0.10", features = ["tracing"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 ```
@@ -1826,7 +1862,7 @@ cargo build --all-features
 能过就说明是 feature。把需要的写进 `Cargo.toml`:
 
 ```toml
-pixhunt = { version = "0.9", features = ["capture-dxgi", "match-corr"] }
+pixhunt = { version = "0.10", features = ["capture-dxgi", "match-corr"] }
 ```
 
 另一种典型:`error: expected 2 arguments` / 找不到 `Window` 变体 —— `CaptureKind::Window(..)`
@@ -2121,6 +2157,7 @@ pixhunt::template   Template
 | v0.7 | v0.8 | `Template` 新增 `pub mask: Option<Vec<bool>>` 字段——用字面量构造 `Template { rgb, width, height }` 的代码需加 `mask: None`;推荐走工厂方法(`load`/`from_rgb`/`from_rgba`)则无需改动。新增 `find_center_on_screen`、`diff_since_last`、`CaptureKind::WindowByTitle`;`Template::load` 现支持 JPEG/WebP |
 | v0.8.0 | v0.8.1 | **无破坏性变更**(只新增 `Match::center`)。但有四处**行为修正**要留意:① `find_all` 的返回顺序从"按 x 优先"改成文档承诺的 `(y, x)` 升序,重叠去重保留的也从"最左"变成"最上最左";② `find_all` 的去重从二次方降为按行增量,`max` 现在会提前停止扫描(平坦画面(1920x1200)从 ~23.5s 回到 ~0.57s;v0.8.2 进一步到 ~9.9ms);③ `XCapCapture` + `region` 时静态帧缓存开始生效(画面没变就复用上次结果,结果与重搜一致);④ `find_until` / `wait_gone` 传 `Duration::MAX` 不再 panic,改为永不超时 |
 | v0.8.1 | v0.8.2 | **无破坏性变更**,且 `find_all` 的**命中集合与顺序逐个字节不变**(新增测试与朴素 O(n²) 参照逐字节对照)。变化是两件事:① 文档明写 `find_on_screen` / `Matcher::find` 在"命中不止一处"时只给 `(y, x)` 序第一个、**不告知还有第二处**,并给出唯一性守卫 `find_all_on_screen(tpl, 2)` 的写法(见 8.1.3);② `find_all` 的早停从"行"粒度细化到"列"粒度(覆盖判定前置 + 攒够 `max` 当场收工 + 整行/整块被覆盖就跳过),平坦画面再快一到四个数量级(1920x1200 纯色帧 + 8x8 `max=0`:串行 ~571ms → ~9.9ms;+ 240x80 `max=0`:串行 ~121s → ~6.6ms)。**唯一要当心的口径变化**:平坦画面上 `parallel` 不再比串行快;有纹理画面的 `find_all` 慢一点(1080p criterion 交替对拍:串行中位 3.99 → 4.17ms,parallel 2.59 → 2.82ms) |
+| v0.9 | v0.10 | **一个破坏面**:`Template` 多了两个内部预计算字段,结构体字面量构造编不过(走 `load`/`from_rgb`/`from_rgba` 的写法**不受影响**;读字段也不受影响)。行为上:`RgbMatcher` 的预筛锚点从"中心+四角"改为模板构造时算好的一组(3~12 个、按鉴别力降序、互相不同色),`with_mask` 会重算它。命中集合与顺序**逐个不变**(真匹配处永远过得了预筛,预筛只能白比、不可能误杀;整窗验证一字未改)。变的只有速度,以及大容差下"活过预筛的错候选数" |
 
 ## 许可
 
