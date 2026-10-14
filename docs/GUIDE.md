@@ -1,6 +1,6 @@
 # pixhunt 使用说明书(从零开始)
 
-> 适用版本:**pixhunt 0.9.0**(本仓库当前版本;上一版 0.8.2 已发布到 crates.io)。
+> 适用版本:**pixhunt 0.10.0**(本仓库当前版本,已发布到 crates.io;上一版 0.9.0)。
 > 读者假设:**你几乎没写过 Rust**,但你想在自己的屏幕上"找一张图在哪里",然后做点事。
 > 这份说明书覆盖**全部对外 API**、每个参数的含义、能直接复制运行的示例、以及报错怎么排查。
 
@@ -214,7 +214,8 @@ if let Some(hit) = m {
 1. 用 Windows 自带的**截图工具**(搜索"截图工具"或按 `Win+Shift+S`),截下你想找的那个小图,**只截它本身**,别带周围背景。
 2. 保存成 PNG,比如 `D:\pic\button.png`。
    - 尺寸建议 **20~200 像素见方**。太小(比如 4x4)容易在屏幕上撞到假的;太大(比如整屏)没必要。
-   - **必须是 PNG**,当前版本只解码 PNG(见 11.4)。
+   - **PNG、JPG、WebP 都能读**(v0.8 起按文件头自动识别,不靠扩展名),存 PNG 最省心;
+     BMP / GIF / TIFF 仍不认,会报 `Error::Image`(见 11.4)。
    - 截图时**不要缩放**。缩放会让像素和屏幕上不一样,导致找不到。
 
 ### 4.2 代码
@@ -1265,6 +1266,7 @@ pub struct CorrMatcher { /* 私有 */ }
 impl CorrMatcher {
     pub fn new() -> Self;                        // 默认配置
     pub fn with_config(cfg: CorrConfig) -> Self; // 自定义
+    pub fn config(&self) -> &CorrConfig;         // 读回当前生效的参数
 }
 impl Default for CorrMatcher;                    // 等价于 new()
 // impl Matcher:只实现了 find —— find_in / find_all 走默认实现
@@ -1688,6 +1690,10 @@ mod tests {
 
 ### 10.1 实测数据(1920x1200,`cargo build --release`,多次取中位数)
 
+> 先说版本口径:下面**截图环节**与**纯匹配环节**两张表是 **0.8.x** 测的。截图那部分可以放心沿用
+> (0.9→0.10 没动过截图代码);纯匹配那几行在 0.10 有变化,见本小节末尾。再往下的三张对照表
+> 都标了各自的出处版本。
+
 **截图环节(整屏)**
 
 | 后端 | 中位耗时 | 最快一次 |
@@ -1770,6 +1776,13 @@ mod tests {
 | `Monitor` + 限定 400x300 区域 | **~20ms** |
 | `Dxgi` + 全屏 | ~18ms |
 
+**v0.9 → v0.10(锚点自适应)这一版的变化**:`cargo bench --bench match` 的同机**交替对拍**
+(两个二进制轮流跑、各取轮间中位)给出:有纹理全屏 `find_all` **+3~5%**——轮间抖动本身有
+±7%,所以这一档落在"看不出稳定差别"里;`rgb_find_all_flat_1080p_max1` **−12.4%**。
+另有一组真机截图 fixture 的测量(跑法见 12.6 的 `ab_prefilter`):没命中约 **2.8~3.0ms**、
+命中约 **0.92~1.00ms**,命中坐标与 0.9 **逐个一致**。这组的编译开关没留档,当量级参考,
+别当基准数字引用。
+
 ### 10.2 结论:钱花在哪了
 
 - **截图占 90% 以上**。想让找图快,先动后端和区域,别优化算法。
@@ -1777,7 +1790,7 @@ mod tests {
 - **限定区域**是第二根杠杆(47ms → 20ms),因为你只截/只扫一小块。
 - 静态桌面轮询:后端不上报"没变"时(`Monitor`/`Gdi`/`Window`),**设了 `region` 就会由库里
   逐字节比对区域帧**来跳过重复搜索;全屏轮询则只有 `Dxgi` 能跳过(见 8.1.3)。
-- `parallel` 在 8 核机上给匹配约 1.5~1.6x(单目标 2.83ms → 1.83ms,多目标 `find_all`
+- `parallel` 在 8 核机上给匹配约 1.5~1.6x(**0.8.x 数字**:单目标 2.83ms → 1.83ms,多目标 `find_all`
   4.1ms → 2.8~3.4ms;算法本身不变,结果完全一致)。ZNCC 提速更明显(13.4ms → 6.4ms)。
   **例外**:平坦画面上的 `find_all`,那里串行流式已经是最优解,并行帮不上忙(见 10.1)。
 
@@ -2054,7 +2067,7 @@ Result<T> = std::result::Result<T, Error>
                   CaptureKind::Window(WindowHandle)
                   CaptureKind::WindowByTitle(String)
 〔gdi 或 dxgi〕   CaptureKind::Auto
-〔match-corr〕    CorrMatcher::new() / with_config(CorrConfig) / Default
+〔match-corr〕    CorrMatcher::new() / with_config(CorrConfig) / config() / Default
                   CorrConfig{max_image_levels, beam_width, roi_radius, min_score, parallel}
                   MatchKind::Corr / MatchKind::CorrWith(CorrConfig)
 〔tracing〕       库内部发出 target="pixhunt" 的 trace 诊断事件 + 一条 region 越界的 warn
@@ -2112,13 +2125,14 @@ pixhunt::template   Template
 (开 feature `tracing` 时只有 `region` 与画面**完全**不相交才会 warn 一次 —— 部分落在
 外面属正常情况,不响。)
 
-### 12.6 仓库自带的三个示例
+### 12.6 仓库自带的四个示例
 
 | 文件 | 跑法 | 演示 |
 | --- | --- | --- |
 | `examples/find_on_screen.rs` | `cargo run --release --example find_on_screen -- path\to\template.png` | 最基础的截一屏找一张图 |
 | `examples/wait_and_click.rs` | `cargo run --release --features capture-gdi --example wait_and_click -- path\to\button.png` | 找到后用 enigo 点中心(含 `capture_from` 挂错误源) |
 | `examples/window_info.rs` | `cargo run --release --features capture-window --example window_info "Program Manager"` | PrintWindow 截窗口 + "自截自找"验证坐标 |
+| `examples/ab_prefilter.rs` | `cargo run --release --features parallel --example ab_prefilter -- 帧.png 模板.png` | 预筛改动的对拍工具:同一帧同一模板逐容差取 12 次中位,顺带打印命中坐标。只用公开 API,所以改动前后两版代码都能编 |
 
 ---
 
@@ -2148,7 +2162,7 @@ pixhunt::template   Template
 
 ---
 
-## 版本迁移备忘(升到 0.8.2 前要知道的)
+## 版本迁移备忘(0.5 → 0.10)
 
 | 从 | 到 | 破坏性变更 |
 | --- | --- | --- |
@@ -2157,12 +2171,16 @@ pixhunt::template   Template
 | v0.7 | v0.8 | `Template` 新增 `pub mask: Option<Vec<bool>>` 字段——用字面量构造 `Template { rgb, width, height }` 的代码需加 `mask: None`;推荐走工厂方法(`load`/`from_rgb`/`from_rgba`)则无需改动。新增 `find_center_on_screen`、`diff_since_last`、`CaptureKind::WindowByTitle`;`Template::load` 现支持 JPEG/WebP |
 | v0.8.0 | v0.8.1 | **无破坏性变更**(只新增 `Match::center`)。但有四处**行为修正**要留意:① `find_all` 的返回顺序从"按 x 优先"改成文档承诺的 `(y, x)` 升序,重叠去重保留的也从"最左"变成"最上最左";② `find_all` 的去重从二次方降为按行增量,`max` 现在会提前停止扫描(平坦画面(1920x1200)从 ~23.5s 回到 ~0.57s;v0.8.2 进一步到 ~9.9ms);③ `XCapCapture` + `region` 时静态帧缓存开始生效(画面没变就复用上次结果,结果与重搜一致);④ `find_until` / `wait_gone` 传 `Duration::MAX` 不再 panic,改为永不超时 |
 | v0.8.1 | v0.8.2 | **无破坏性变更**,且 `find_all` 的**命中集合与顺序逐个字节不变**(新增测试与朴素 O(n²) 参照逐字节对照)。变化是两件事:① 文档明写 `find_on_screen` / `Matcher::find` 在"命中不止一处"时只给 `(y, x)` 序第一个、**不告知还有第二处**,并给出唯一性守卫 `find_all_on_screen(tpl, 2)` 的写法(见 8.1.3);② `find_all` 的早停从"行"粒度细化到"列"粒度(覆盖判定前置 + 攒够 `max` 当场收工 + 整行/整块被覆盖就跳过),平坦画面再快一到四个数量级(1920x1200 纯色帧 + 8x8 `max=0`:串行 ~571ms → ~9.9ms;+ 240x80 `max=0`:串行 ~121s → ~6.6ms)。**唯一要当心的口径变化**:平坦画面上 `parallel` 不再比串行快;有纹理画面的 `find_all` 慢一点(1080p criterion 交替对拍:串行中位 3.99 → 4.17ms,parallel 2.59 → 2.82ms) |
+| v0.8.2 | v0.9 | **一个破坏面**:xcap 由硬依赖改成可选 feature `capture-xcap`(默认开)。写 `default-features = false` 的代码从此**一个截图后端都没有**——`CaptureKind::Monitor` 会编不过,只剩匹配核心(`Frame` / `Template` / `RgbMatcher` / 颜色搜索),帧要宿主自己注入(安卓就是这个用法);不写这行的桌面用户感受不变。同版还加了 `Template::load` 的 4000 万像素上限(超限返回 `ImageError::Limits`,见 8.4.2),以及修掉了 GDI 在分辨率变化那一帧画面错位/越界的 bug |
 | v0.9 | v0.10 | **一个破坏面**:`Template` 多了两个内部预计算字段,结构体字面量构造编不过(走 `load`/`from_rgb`/`from_rgba` 的写法**不受影响**;读字段也不受影响)。行为上:`RgbMatcher` 的预筛锚点从"中心+四角"改为模板构造时算好的一组(3~12 个、按鉴别力降序、互相不同色),`with_mask` 会重算它。命中集合与顺序**逐个不变**(真匹配处永远过得了预筛,预筛只能白比、不可能误杀;整窗验证一字未改)。变的只有速度,以及大容差下"活过预筛的错候选数" |
 
 ## 许可
 
 MIT OR Apache-2.0。
 
-> 本说明书内容由 AI 编码助手依据 **pixhunt 0.8.2 的实际源码**逐个 API 清点后撰写,
-> 不保证逐行经过人工细读。若你升级了版本,请以 `cargo doc --no-deps --open` 生成的
-> 最新文档和源码为准。
+> 本说明书内容由 AI 编码助手依据 **pixhunt 0.8.2 的实际源码**逐个 API 清点后撰写;
+> **0.10.0** 这一版重新对照源码清点过全部对外 API(第 7、12 章的名单与 `src/` 里的
+> `pub` 项逐个对得上,无遗漏无多余),并按 0.10 的行为改写过 1、8.1.6、8.1.7、8.4、
+> 8.6.2、9.8、12.6 与本节迁移表。**第 10 章的性能数字大多仍是 0.8.x 时代测的**,
+> 那里逐张表标注了出处版本。不保证逐行经过人工细读;若你升级了版本,请以
+> `cargo doc --no-deps --open` 生成的最新文档和源码为准。

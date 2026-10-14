@@ -35,7 +35,7 @@ if let Some(m) = finder.find_on_screen(&tpl)? {
   核心概念、**全部对外 API 逐个详解**(真实签名 + 参数 + 返回 + 坑)、任务配方、性能调参、
   报错排查、API 速查表。
 - `cargo doc --no-deps --open` —— 本地生成的 API 参考(以源码注释为准)。
-- `examples/` 三个可运行示例的用法见说明书 12.6。
+- `examples/` 四个可运行示例的用法见说明书 12.6。
 
 ## 设计:两个可插拔"插座"
 - **`Capture`** 负责"怎么拿到画面"。
