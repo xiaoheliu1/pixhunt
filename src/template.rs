@@ -73,6 +73,11 @@ const ANCHOR_POOL: usize = 250_000;
 /// ⚠️ 字段是公开的,但**内部另有两个不可见的预计算字段**,所以不能再用
 /// `Template { rgb, width, height, mask }` 这种结构体字面量构造(编不过);改用
 /// [`Template::from_rgb`] / [`Template::from_rgba`] / [`Template::load`]。
+///
+/// ⚠️ **公开字段只读**:锚点与外接框是构造时按 `rgb` / `width` / `height` / `mask`
+/// 算好的,构造完再直接改这些字段**不会重算**。改 `rgb` 会让锚点颜色过期(可能静默
+/// 漏检),改尺寸或掩码会让锚点越界(debug 构建下 panic)。要换内容请重新构造;
+/// 只想换掩码用 [`Template::with_mask`] (它会重算)。
 #[derive(Clone, Debug)]
 pub struct Template {
     pub rgb: Vec<u8>,

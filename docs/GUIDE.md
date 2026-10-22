@@ -656,7 +656,8 @@ if rs[0].is_some() { println!("当前在主页"); }
   其余情况(静态画面 + `Monitor`/`Gdi`/`Window` + 全屏)每轮都是真截图 + 真搜索,
   想省 CPU 就把 `interval` 设大点。
 - 等得久时想确认它还在转:开 feature `tracing`,每等满 5 秒会多一条
-  `op = "poll_progress"` 的 trace(已等了多久、拍了几次)。
+  `op = "poll_progress"` 的 trace(已等了多久、拍了几次)。进度在每轮搜索结束后
+  检查,所以 `interval` 大于 5 秒时实际是每轮一条。
 
 ```rust
 use std::time::Duration;
@@ -673,7 +674,7 @@ let m = finder.find_until(&tpl, Duration::MAX, Duration::from_millis(200))?; // 
 - 语义与 `find_until` 相反,注意别搞混:**它返回 `bool` 而不是 `Option<Match>`**。
 - 超时参数同样没有上限,`Duration::MAX` 视为永不超时、`Duration::ZERO` 是只看一眼
   (还在 = `false`,不见了 = `true`)。同样**没有中途叫停的通道**;开 `tracing` 时
-  也是每 5 秒一条 `poll_progress`。缓存/轮询行为见 8.1.6。
+  也是每 5 秒检查一次进度(`interval` 大于 5 秒时每轮一条)。缓存/轮询行为见 8.1.6。
 
 典型用途:等"正在保存…"的提示条不见了再继续下一步。
 
@@ -813,8 +814,9 @@ pub enum CaptureKind {
 两个要命的限制:
 
 - `Dxgi` 在**远程桌面(RDP)、锁屏界面、没有 GPU** 时不可用 → `build()` 直接报错。
-- `Monitor` / `Gdi` / `Dxgi` **只覆盖主显示器**。要副屏:用 `XCapCapture::from_point(x, y)`
-  再 `Finder::new(..)`(8.1.2),或 `CaptureKind::Window(句柄)`。
+- `Monitor` / `Gdi` 覆盖**主显示器**;`Dxgi` 取的是 `EnumAdapters(0)` + `EnumOutputs(0)`,
+  单显卡时就是主屏,**多显卡(核显 + 独显)时不保证**。要副屏:用
+  `XCapCapture::from_point(x, y)` 再 `Finder::new(..)`(8.1.2),或 `CaptureKind::Window(句柄)`。
 
 #### 8.2.3 `MatchKind`(选算法)
 
@@ -935,6 +937,11 @@ pub struct Template {
 `Template { rgb, width, height, mask }` 这种**结构体字面量构造编不过**。改走工厂方法
 就行:`Template::from_rgb(...)` / `Template::from_rgba(...)` / `Template::load(...)`。
 读字段(`tpl.width` 等)不受影响。
+
+⚠️ **公开字段只读**:锚点与外接框是构造时按 `rgb` / `width` / `height` / `mask`
+算好的,构造完再直接改这些字段**不会重算**。改 `rgb` 会让锚点颜色过期(可能静默
+漏检),改尺寸或掩码会让锚点越界(debug 构建下 panic)。要换内容就重新构造;只想
+换掩码用 `with_mask`(它会重算)。
 
 #### 8.4.2 `Template::load(path: impl AsRef<Path>) -> Result<Self>`
 
@@ -1607,7 +1614,8 @@ if let Some(b) = blobs.first() {
 ### 9.8 "为什么找不到?"——开 tracing 看内部发生了什么
 
 库内置了 trace 级诊断事件(后端名、帧尺寸、截图/搜索耗时、是否命中、有没有走缓存,
-以及**长轮询每 5 秒一条 `op = "poll_progress"`** —— 等很久时靠它区分"还在转"和"卡死了")。
+以及**长轮询每 5 秒检查一次 `op = "poll_progress"`** —— 等很久时靠它区分"还在转"和"卡死了";
+`interval` 大于 5 秒时实际是每轮一条)。
 需要两步:开 feature + 你在自己程序里装一个"订阅器"。
 
 `Cargo.toml`:

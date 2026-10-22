@@ -234,7 +234,8 @@ impl Finder {
     /// 你自己的条件(截图失败照样是 `Err`,和这里同口径)。
     ///
     /// 等待过程的可见性:开 feature `tracing` 时,每等满 5 秒会多一条
-    /// `op = "poll_progress"` 的 trace(已等了多久、拍了几次);不开 feature 甚至一条也不输出。
+    /// `op = "poll_progress"` 的 trace(已等了多久、拍了几次)。进度在每轮搜索结束后
+    /// 检查,所以 `interval` 大于 5 秒时实际是每轮一条;不开 feature 一条也不输出。
     pub fn find_until(
         &mut self,
         tpl: &Template,
@@ -255,7 +256,8 @@ impl Finder {
     ///
     /// 同 [`Finder::find_until`]:超大的 `timeout`(如 `Duration::MAX`)视为永不超时,
     /// `Duration::ZERO` 是只看一眼(仍会拍一次,还在 = `false`,不见了 = `true`);
-    /// 同样**没有中途叫停的通道**,想能停就自己组循环;开 `tracing` 时同样是每 5 秒一条进度。
+    /// 同样**没有中途叫停的通道**,想能停就自己组循环;开 `tracing` 时同样是每 5 秒
+    /// 检查一次进度(`interval` 大于 5 秒时每轮一条)。
     pub fn wait_gone(
         &mut self,
         tpl: &Template,

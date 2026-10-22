@@ -504,6 +504,22 @@ impl<'a> Scan<'a> {
         }
         let tw3 = tw * 3;
         let mask = tpl.mask.as_deref();
+        // 公开字段可以被调用方直接改写,而锚点与外接框只在构造时算一次。
+        // 下面三条把"改了字段却没有重新构造"的契约违反在 debug 构建里变成明确
+        // panic,而不是整窗验证时的越界 panic 或锚点过期后的静默漏检。
+        debug_assert_eq!(
+            tpl.rgb.len(),
+            tw * th * 3,
+            "Template::rgb 长度与 width*height*3 不一致(字段被改写后没有重新构造)"
+        );
+        debug_assert!(
+            mask.is_none_or(|m| m.len() == tw * th),
+            "Template::mask 长度与 width*height 不一致(字段被改写后没有重新构造)"
+        );
+        debug_assert!(
+            tpl.anchors.iter().all(|a| a.sx < tw && a.sy < th),
+            "Template 锚点超出 width/height(字段被改写后没有重新构造)"
+        );
         // 重叠抑制用的宽/高与预筛锚点都在模板构造时算好了,这里只读(见 [`Template`])。
         let (vbw, vbh) = tpl.visible_box;
         Some(Scan {
