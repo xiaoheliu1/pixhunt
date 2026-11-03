@@ -7,10 +7,10 @@ use crate::frame::Frame;
 use crate::{Error, Result};
 
 use std::ffi::c_void;
-use windows::Win32::Foundation::HWND;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    GetDeviceCaps, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDCW, DeleteDC, DeleteObject,
+    GetDIBits, GetDeviceCaps, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
     HDC, HGDIOBJ, HORZRES, SRCCOPY, VERTRES,
 };
 
@@ -26,13 +26,36 @@ struct FastCap {
 }
 
 impl FastCap {
-    fn new_primary() -> Self {
+    fn new_primary() -> Result<Self> {
         unsafe {
-            let hdc_screen = GetDC(HWND::default());
+            // 显式绑定主显示器("DISPLAY"),不用 GetDC(NULL):后者官方文档说
+            // "整个屏幕",但 Windows 10 2004+ 的实际覆盖范围存在版本差异,拿它
+            // 截图会在多屏机器上悄悄抓到别的位置。`w!` 会补上 PCWSTR 需要的终止符。
+            let hdc_screen = CreateDCW(w!("DISPLAY"), PCWSTR::null(), PCWSTR::null(), None);
+            if hdc_screen.is_invalid() {
+                return Err(Error::capture("CreateDC(\"DISPLAY\") failed (no display session?)"));
+            }
             let w = GetDeviceCaps(hdc_screen, HORZRES) as usize;
             let h = GetDeviceCaps(hdc_screen, VERTRES) as usize;
+            // 尺寸为 0 说明没有有效显示会话:必须早失败,否则会造出"位图 1x1 但
+            // bmi/self.w/h 记 0"的残废实例(直到 grab_into 的 BitBlt/GetDIBits 才崩)。
+            if w == 0 || h == 0 {
+                let _ = DeleteDC(hdc_screen);
+                return Err(Error::capture(
+                    "CreateDC(\"DISPLAY\") reported a 0x0 desktop (no display session?)",
+                ));
+            }
             let hdc_mem = CreateCompatibleDC(hdc_screen);
-            let hbmp = CreateCompatibleBitmap(hdc_screen, w as i32, h as i32);
+            if hdc_mem.is_invalid() {
+                let _ = DeleteDC(hdc_screen);
+                return Err(Error::capture("CreateCompatibleDC failed"));
+            }
+            let hbmp = CreateCompatibleBitmap(hdc_screen, w.max(1) as i32, h.max(1) as i32);
+            if hbmp.is_invalid() {
+                let _ = DeleteDC(hdc_mem);
+                let _ = DeleteDC(hdc_screen);
+                return Err(Error::capture("CreateCompatibleBitmap failed"));
+            }
             let old = SelectObject(hdc_mem, hbmp);
 
             let mut bmi: BITMAPINFO = std::mem::zeroed();
@@ -43,7 +66,7 @@ impl FastCap {
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = 0; // BI_RGB
 
-            Self {
+            Ok(Self {
                 hdc_screen,
                 hdc_mem,
                 hbmp,
@@ -51,7 +74,7 @@ impl FastCap {
                 w,
                 h,
                 bmi,
-            }
+            })
         }
     }
 
@@ -135,7 +158,8 @@ impl Drop for FastCap {
             SelectObject(self.hdc_mem, self.old);
             let _ = DeleteObject(self.hbmp);
             let _ = DeleteDC(self.hdc_mem);
-            ReleaseDC(HWND::default(), self.hdc_screen);
+            // 屏幕 DC 来自 CreateDCW,配对的是 DeleteDC(旧的 GetDC(NULL) 才用 ReleaseDC)。
+            let _ = DeleteDC(self.hdc_screen);
         }
     }
 }
@@ -148,13 +172,14 @@ pub struct GdiCapture {
 impl GdiCapture {
     /// 在主显示器上创建(仅 Windows)。
     ///
-    /// 尺寸取的是 `GetDC(NULL)` + `HORZRES/VERTRES`,即**主显示器那一块**,不含副屏,
-    /// 也不含负坐标区域。多屏时要按坐标选屏请用 `XCapCapture::from_point`,要盯
-    /// 某个窗口请用 `WindowCapture`。
-    pub fn new_primary() -> Self {
-        GdiCapture {
-            inner: FastCap::new_primary(),
-        }
+    /// 通过 `CreateDCW("DISPLAY")` **显式绑定主显示器**,尺寸取该 DC 的
+    /// `HORZRES/VERTRES`,不含副屏,也不含负坐标区域;显示会话不可用(锁屏过渡、
+    /// 无人登录)时返回 [`Error::Capture`] 而不是留下一个残废实例。多屏时要按坐标
+    /// 选屏请用 `XCapCapture::from_point`,要盯某个窗口请用 `WindowCapture`。
+    pub fn new_primary() -> Result<Self> {
+        Ok(GdiCapture {
+            inner: FastCap::new_primary()?,
+        })
     }
 }
 

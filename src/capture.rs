@@ -50,6 +50,12 @@ fn xcap_err(step: impl Into<String>, e: xcap::XCapError) -> Error {
 ///
 /// 一个实例绑定一个显示器,`Monitor` 对象**可长期复用**(内部只存显示器句柄与几何
 /// 信息),每帧 `grab` 不会重新枚举显示器。
+///
+/// ⚠️ 每帧分配:`capture_image()` 会新建整帧缓冲(1080p 约 8 MB),xcap 没有
+/// "写进调用方缓冲"的接口。曾实测覆写 [`Capture::grab_into`] 复用 `dst.pixels`:
+/// 省下的分配约 0.006 ms,多付的一次整帧拷贝约 0.8 ms,是**负收益**,故保持默认实现。
+/// 高频轮询请改用 Windows 的三个后端(`Gdi` / `Dxgi` / `Window`),它们把像素直接
+/// 写进复用缓冲。
 #[cfg(feature = "capture-xcap")]
 pub struct XCapCapture {
     monitor: xcap::Monitor,

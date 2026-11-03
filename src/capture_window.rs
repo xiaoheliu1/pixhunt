@@ -16,7 +16,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 // windows 0.51 的元数据将 PrintWindow 归在 Win32::Storage::Xps 下(历史遗留分类)。
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetClientRect, PW_RENDERFULLCONTENT};
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, GetClientRect, IsWindow, PW_RENDERFULLCONTENT,
+};
 
 /// 原生窗口句柄(与 `HWND` 底层一致,避免把 `windows` crate 类型泄漏进公共 API)。
 pub type WindowHandle = isize;
@@ -96,6 +98,9 @@ impl PrintCap {
     }
 
     /// PrintWindow 渲染客户区到内存位图,再 `GetDIBits` 直写 `dst`(BGRA)。
+    ///
+    /// 句柄有效性由两个公开入口(`Capture::grab` / `Capture::grab_into`)在调用
+    /// 前统一校验,这里不重复查。
     fn grab_into(&mut self, dst: &mut Vec<u8>) -> Result<()> {
         self.resize_if_needed();
         if self.w == 0 || self.h == 0 {
@@ -157,6 +162,18 @@ fn client_size(hwnd: HWND) -> (usize, usize) {
     }
 }
 
+/// 句柄失效要赶在尺寸检查之前说清楚:销毁后 `GetClientRect` 给 0,若先撞上
+/// "empty client area (minimized?)",会把"目标没了"误导成"等等就好"。
+/// `IsWindow` 是纯查表,每次抓取多一次调用,成本可忽略。
+fn check_hwnd(hwnd: HWND) -> Result<()> {
+    unsafe {
+        if !IsWindow(hwnd).as_bool() {
+            return Err(Error::capture("window handle invalid (destroyed?)"));
+        }
+        Ok(())
+    }
+}
+
 fn make_bmi(w: usize, h: usize) -> BITMAPINFO {
     unsafe {
         let mut bmi: BITMAPINFO = std::mem::zeroed();
@@ -210,6 +227,7 @@ impl WindowCapture {
 
 impl Capture for WindowCapture {
     fn grab(&mut self) -> Result<Frame> {
+        check_hwnd(self.inner.hwnd)?;
         self.inner.resize_if_needed();
         let (w, h) = (self.inner.w, self.inner.h);
         if w == 0 || h == 0 {
@@ -223,6 +241,7 @@ impl Capture for WindowCapture {
     }
 
     fn grab_into(&mut self, dst: &mut Frame) -> Result<bool> {
+        check_hwnd(self.inner.hwnd)?;
         self.inner.resize_if_needed();
         let (w, h) = (self.inner.w, self.inner.h);
         if w == 0 || h == 0 {
@@ -237,5 +256,87 @@ impl Capture for WindowCapture {
 
     fn backend(&self) -> &'static str {
         "print-window"
+    }
+}
+
+#[cfg(all(windows, test))]
+mod tests {
+    use super::*;
+    use windows::core::w;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetWindowLongPtrW,
+        CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, WM_NCCREATE, WNDCLASSW,
+        WS_OVERLAPPEDWINDOW,
+    };
+
+    /// 隐藏测试窗口的窗口过程:WM_NCCREATE 把 CREATESTRUCTW 挂到窗口属性上,
+    /// 其余消息一律走 DefWindowProcW(不这么做,创建/销毁阶段窗口会自己报错)。
+    unsafe extern "system" fn wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        if msg == WM_NCCREATE {
+            let cs = &*(lparam.0 as *const CREATESTRUCTW);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    /// 句柄失效必须**早失败且说清原因**:真建一个隐藏窗口、销毁、再抓,报错要
+    /// 指向 "handle invalid",而不是拖到 PrintWindow 给无法诊断的失败,也不是
+    /// 误导性的 "empty client area (minimized?)"。
+    #[test]
+    fn destroyed_window_reports_invalid_handle() {
+        let class = w!("PixhuntInvalidHwndTest");
+        unsafe {
+            let hmod = windows::Win32::Foundation::HINSTANCE::default();
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(wndproc),
+                hInstance: hmod,
+                lpszClassName: class,
+                ..std::mem::zeroed()
+            };
+            // 类名唯一且本测试进程内只注册一次,返回 0 就是真失败。
+            assert!(RegisterClassW(&wc) != 0, "RegisterClassW failed");
+            let hwnd = CreateWindowExW(
+                Default::default(),
+                class,
+                w!("pixhunt invalid hwnd test"),
+                WS_OVERLAPPEDWINDOW, // 不带 WS_VISIBLE:隐藏窗口,不打扰桌面
+                0,
+                0,
+                200,
+                160,
+                HWND::default(),
+                None,
+                hmod,
+                None,
+            );
+            assert!(hwnd.0 != 0, "测试窗口创建失败");
+            // 前置确认:活着时客户区尺寸正常,而且**不会**报句柄错误
+            // (不校验打印机会因 PW 路径报别的错,这里只钉"不是 handle invalid")。
+            let mut cap = WindowCapture::new(hwnd.0);
+            assert!(cap.size().0 > 0, "隐藏窗口的客户区也应有尺寸");
+            // 存活时抓一次:成功或走 PrintWindow 的别的错都无所谓,唯独不能报
+            // "handle invalid"——否则一个对所有句柄都返回失效的 check_hwnd 也能骗过本测试。
+            let alive = cap.grab();
+            assert!(
+                !format!("{:?}", alive.as_ref().err()).contains("handle invalid"),
+                "窗口还活着却被判成句柄失效: {alive:?}"
+            );
+            DestroyWindow(hwnd).ok();
+            let err = cap
+                .grab()
+                .expect_err("句柄已销毁,抓取必须报错而不是静默");
+            let text = err.to_string();
+            assert!(
+                text.contains("handle invalid"),
+                "错误应指向失效句柄,实际: {text}"
+            );
+        }
     }
 }

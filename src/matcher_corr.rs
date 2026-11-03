@@ -65,8 +65,13 @@ pub struct CorrConfig {
     pub beam_width: usize,
     /// 逐层精修的 ROI 半径(默认 8)。已知目标位移很小时可调小提速。
     pub roi_radius: usize,
-    /// **最终结果**的最低分门槛(默认不过滤)。低于此分视为未命中,`score` 取值
+    /// **最终结果**的最低分门槛(默认 `0.5`)。低于此分视为未命中,`score` 取值
     /// `0.0..=1.0`(ZNCC 相似度)。
+    ///
+    /// 默认给门槛是因为 ZNCC **无目标时也会给出一个峰值**(噪声帧上通常 < 0.4):
+    /// 不过滤的话 `find_on_screen` 会把 0.05 的"勉强像"照常返回 `Some`,与
+    /// "确实命中"无法区分。v0.11 起默认从"不过滤"改为 `0.5`;要旧行为请显式写
+    /// `f32::NEG_INFINITY`,要更强置信写 0.7+。
     ///
     /// 在 pixhunt 侧过滤,不会传给 corrmatch——后者的 `min_score` 是**逐金字塔层**的
     /// 候选门槛,而粗筛层的 ZNCC 分数天然偏低(降采样吃掉了对比度),拿它当最终阈值
@@ -85,7 +90,7 @@ impl Default for CorrConfig {
             max_image_levels: 6,
             beam_width: 8,
             roi_radius: 8,
-            min_score: f32::NEG_INFINITY,
+            min_score: 0.5,
             parallel: cfg!(feature = "parallel"),
         }
     }
@@ -98,10 +103,13 @@ impl CorrConfig {
             max_image_levels: self.max_image_levels.max(1),
             beam_width: self.beam_width.max(1),
             roi_radius: self.roi_radius.max(1),
-            // NaN 会污染比较,归一为不限制;正无穷钳到 f32::MAX(任何结果都不达标),
-            // 负无穷保持"不过滤"。
+            // NaN 保持原样透传:`res.score < NaN` 恒为 false,门槛自然不生效(结果照常
+            // 返回),与文档"配错也不静默找不到"的口径一致。默认值是 0.5 之后,
+            // 把 NaN 归成 NEG_INFINITY 反而会让文档里"默认 0.5"在写了 NaN 时悄悄变味,
+            // 透传则行为完全由 IEEE 比较语义决定,不多一条特例。正无穷钳到 f32::MAX
+            // (任何结果都不达标),负无穷保持"不过滤"。
             min_score: match self.min_score {
-                v if v.is_nan() || v == f32::NEG_INFINITY => f32::NEG_INFINITY,
+                v if v.is_nan() => v,
                 v if v == f32::INFINITY => f32::MAX,
                 v => v,
             },
@@ -127,7 +135,7 @@ pub struct CorrMatcher {
 }
 
 impl CorrMatcher {
-    /// 默认配置(纯平移 + corrmatch 默认搜索参数)。
+    /// 默认配置(纯平移 + corrmatch 默认搜索参数,含 `min_score = 0.5` 的最终门槛)。
     pub fn new() -> Self {
         Self::with_config(CorrConfig::default())
     }
@@ -312,6 +320,46 @@ mod tests {
         assert!(hit.score > 0.9, "命中置信度过低: {}", hit.score);
     }
 
+    /// 回归(v0.11 默认阈值):屏幕上是"有对比度但没有目标"的噪声画面时,ZNCC
+    /// 仍会给出一个峰值,但它应远低于真命中。默认配置必须回答 `None`,而不是把
+    /// 低分假命中照常返回 `Some`;显式关掉门槛(`NEG_INFINITY`)才拿得到那个峰值,
+    /// 用它当场钉死"默认 0.5 确实拦住了这一类"。
+    #[test]
+    fn default_min_score_rejects_weak_peak() {
+        let (w, h) = (256usize, 256usize);
+        let mut px = noisy_bg(w, h);
+        let rgb = paste_textured(&mut px, w, 150, 120, 32);
+        let with_target = Frame::rgba8(w, h, px.clone());
+        // 同一张模板,拿去贴到**没放过目标**的背景上——这才是"无中生有"的那一帧。
+        px[..].copy_from_slice(&noisy_bg(w, h));
+        let no_target = Frame::rgba8(w, h, px);
+        let t = Template::from_rgb(rgb, 32, 32);
+
+        // 无门槛时先看清两个分数:真命中应高,假峰值应低。
+        let loose = CorrMatcher::with_config(CorrConfig {
+            min_score: f32::NEG_INFINITY,
+            ..CorrConfig::default()
+        });
+        let hit = loose.find(&with_target, &t).expect("无门槛时真命中必须可见");
+        assert!(hit.score > 0.9, "真命中分数应很高: {}", hit.score);
+        let fake = loose
+            .find(&no_target, &t)
+            .expect("无门槛时假峰值也会返回");
+        assert!(
+            fake.score < 0.5,
+            "无目标帧的峰值应低于默认门槛 0.5,否则这条回归不成立(实测 {})",
+            fake.score
+        );
+
+        // 默认配置:高者留、低者拒。
+        let m = CorrMatcher::new();
+        assert!(m.find(&with_target, &t).is_some(), "真命中不能被默认门槛削掉");
+        assert!(
+            m.find(&no_target, &t).is_none(),
+            "低置信假峰值必须被默认 min_score 拦住"
+        );
+    }
+
     /// 非法参数被夹到安全下限,而不是导致静默失败。
     #[test]
     fn invalid_config_is_clamped() {
@@ -326,7 +374,8 @@ mod tests {
         assert_eq!(s.max_image_levels, 1);
         assert_eq!(s.beam_width, 1);
         assert_eq!(s.roi_radius, 1);
-        assert_eq!(s.min_score, f32::NEG_INFINITY);
+        // NaN 原样透传(比较恒为 false,门槛不生效),不再归成 NEG_INFINITY
+        assert!(s.min_score.is_nan());
         // parallel 只在 feature 打开时才保留 true
         assert_eq!(s.parallel, cfg!(feature = "parallel"));
     }

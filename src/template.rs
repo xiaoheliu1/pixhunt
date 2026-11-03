@@ -227,6 +227,13 @@ impl Template {
 
     /// 所有公开构造出口的收口:顺手把可见外接框与预筛锚点算好。
     fn assemble(rgb: Vec<u8>, width: usize, height: usize, mask: Option<Vec<bool>>) -> Self {
+        // `load` 有 `check_template_size` 把关,`from_rgb`/`from_rgba` 拿的是调用方
+        // 已在内存里的像素,不另加硬上限(会破坏语义);但 `visible_bounds`/锚点是
+        // O(w·h) 全量遍历,误传巨图时 debug 构建要先炸给调用方看。
+        debug_assert!(
+            width.saturating_mul(height) <= MAX_TEMPLATE_PIXELS,
+            "模板超过 {MAX_TEMPLATE_PIXELS} 像素:锚点预计算会非常慢,请确认尺寸传对了吗"
+        );
         let bounds = Self::visible_bounds(width, height, mask.as_deref());
         let visible_box = match bounds {
             Some((_, _, w, h)) => (w, h),

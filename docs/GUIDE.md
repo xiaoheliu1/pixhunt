@@ -120,14 +120,14 @@ myhunter/
 
 ```toml
 [dependencies]
-pixhunt = "0.10"
+pixhunt = "0.11"
 ```
 
 想用 Windows 上更快的截图后端或更强的算法,就开对应"功能开关"(第 6 章详解):
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.10", features = ["capture-dxgi", "capture-gdi", "capture-window", "match-corr", "parallel"] }
+pixhunt = { version = "0.11", features = ["capture-dxgi", "capture-gdi", "capture-window", "match-corr", "parallel"] }
 ```
 
 改完保存。**不需要手动下载**,第一次运行 `cargo run` 时 Cargo 会自动联网抓依赖。
@@ -412,7 +412,7 @@ Rust 的 `feature` 就是**编译时的可选开关**。库里写了很多代码
 ```toml
 # 永久:写进 Cargo.toml
 [dependencies]
-pixhunt = { version = "0.10", features = ["capture-dxgi", "match-corr", "parallel"] }
+pixhunt = { version = "0.11", features = ["capture-dxgi", "match-corr", "parallel"] }
 ```
 
 ```powershell
@@ -647,7 +647,8 @@ if rs[0].is_some() { println!("当前在主页"); }
   `checked_add` 算截止时刻,算不出来就当**永不超时**,不会 panic。v0.8.0 之前这里会
   在 `Instant::now() + timeout` 溢出时当场 panic。
 - `Duration::ZERO` 是**只看一眼**:仍会截一帧、找一次,没命中就立刻返回 `None`。
-  `interval` 传 `ZERO` 则是"圈与圈之间不额外睡",节流全靠截图本身耗时。
+  `interval` 传 `ZERO` 在 v0.10 及以前是"圈与圈之间不额外睡"(全速自旋,能把单核打满);
+  **v0.11 起直接返回 `Err`**,要极限节奏请自己拿 `find_on_screen` 组循环。
 - ⚠️ **一旦进来就没有中途叫停的通道**:只有"命中""到点""截图报错"三个出口,期间
   既没有回调也读不到任何外部标志。等 10 秒无所谓,等 1 小时就是把自己关在里面。
   要"等很久又能随时收手",别用它——自己拿 `find_on_screen` 组循环,每圈去问你自己的条件。
@@ -673,7 +674,8 @@ let m = finder.find_until(&tpl, Duration::MAX, Duration::from_millis(200))?; // 
 - `Ok(false)`:到时间了还在(比如加载遮罩一直转)。
 - 语义与 `find_until` 相反,注意别搞混:**它返回 `bool` 而不是 `Option<Match>`**。
 - 超时参数同样没有上限,`Duration::MAX` 视为永不超时、`Duration::ZERO` 是只看一眼
-  (还在 = `false`,不见了 = `true`)。同样**没有中途叫停的通道**;开 `tracing` 时
+  (还在 = `false`,不见了 = `true`);`interval` 传 `ZERO` 同样直接返回 `Err`(v0.11 起)。
+  同样**没有中途叫停的通道**;开 `tracing` 时
   也是每 5 秒检查一次进度(`interval` 大于 5 秒时每轮一条)。缓存/轮询行为见 8.1.6。
 
 典型用途:等"正在保存…"的提示条不见了再继续下一步。
@@ -780,9 +782,11 @@ pub fn build(self) -> Result<Finder>
 前三个是"链式设置":吃掉 `self` 再吐回来,所以能一行接一行写。
 `impl Into<Rect>` 的意思是:**`Rect` 或 `(x, y, width, height)` 元组都行**。
 
-`build()` 返回 `Result`。目前只有两种失败:选 `Dxgi` 但这台机器开不了桌面复制
-(报 `capture error: DXGI desktop duplication unavailable`),或选 `Monitor` 却拿不到显示器
-(报 `capture error: xcap Monitor::all(): ...`)。
+`build()` 返回 `Result`。失败面(v0.11 起):选 `Dxgi` 但这台机器开不了桌面复制
+(报 `capture error: DXGI desktop duplication unavailable`),选 `Monitor` 却拿不到显示器
+(报 `capture error: xcap Monitor::all(): ...`),选 `Gdi` 但无有效显示会话
+(报 `capture error: CreateDC("DISPLAY") ...`,v0.11 起 GDI 构造会失败而非留下残废实例),
+选 `WindowByTitle` 却按标题找不到窗口,或 `Auto` 三档全部失败。
 
 ⚠️ `FinderBuilder` **没有**从 crate 根重新导出。你不需要给它命名(链式调用即可);
 真要在函数签名里写它,用 `pixhunt::finder::FinderBuilder`。
@@ -1101,12 +1105,17 @@ if let Some(sub) = cap.grab_region((100, 100, 400, 300).into())? {
 #### 8.5.3 `GdiCapture` 〔f:capture-gdi〕(仅 Windows)
 
 ```rust
-impl GdiCapture { pub fn new_primary() -> Self }     // 注意:不返回 Result / Option
+impl GdiCapture { pub fn new_primary() -> Result<Self> }    // v0.11 起;此前返回 Self(永不失败)
 // impl Capture:grab / grab_into / backend -> "gdi"
 ```
 
-- 用 `GetDC(NULL)` + `BitBlt` + `GetDIBits`,输出 **BGRA**。
-- 只覆盖主屏。**每次抓取前会比对一次桌面尺寸**(`GetDeviceCaps(HORZRES/VERTRES)`),
+- 用 `CreateDC("DISPLAY")` + `BitBlt` + `GetDIBits`,输出 **BGRA**。v0.11 起不再用
+  `GetDC(NULL)`——后者对"整个屏幕"的覆盖范围在 Windows 10 2004+ 上存在版本争议,
+  `CreateDC("DISPLAY")` 则明确定义为显示驱动(主显示器)。
+- 只覆盖主屏。构造时 `CreateDC` / `CreateCompatibleDC` / `CreateCompatibleBitmap`
+  逐一判空,无显示会话(锁屏过渡、无人登录)返回 `Err` 而不是留下尺寸为 0 的残废实例
+  (v0.11 起;`CaptureKind::Auto` 也因此能在 GDI 失败时回退到 xcap)。
+  **每次抓取前会比对一次桌面尺寸**(`GetDeviceCaps(HORZRES/VERTRES)`),
   分辨率 / DPI 缩放改变、换了主显示器之后会自行重建位图跟上(v0.8 起;更早的版本尺寸在
   构造时定死,改完分辨率会一直输出错位画面)。实测这两次查询的影响不可分辨
   (`find_on_screen` P50:加检测前 33.33 ms,加检测后 33.60 ms)。
@@ -1159,6 +1168,9 @@ impl WindowCapture {
 - **被别的窗口挡住也能截**——这是 `PrintWindow` 的本事,全屏后端做不到。
 - ⚠️ 命中坐标是**相对该窗口客户区左上角**的,不是屏幕绝对坐标。要点击得先加窗口位置偏移
   (窗口位置要用别的 Win32 代码或别的库拿,pixhunt 不提供)。
+- **抓取入口先 `IsWindow` 前置校验**(v0.11 起):句柄已销毁 → 报
+  `Err(capture error: window handle invalid (destroyed?))`,排在下面的客户区检查之前,
+  不会把"目标没了"误导成"等它恢复"。
 - 窗口最小化 / 客户区尺寸为 0 → 返回 `Err(capture error: window has an empty client area (minimized?))`。
 - `from_title` 是便捷入口:标题**精确匹配**(不是模糊、不是包含),找不到报
   `no top-level window with title "..."`。生产更推荐你自己拿到句柄后用 `new`。
@@ -1309,7 +1321,7 @@ pub struct CorrConfig {
     pub max_image_levels: usize,  // 默认 6
     pub beam_width: usize,        // 默认 8
     pub roi_radius: usize,        // 默认 8
-    pub min_score: f32,           // 默认 NEG_INFINITY(不过滤)
+    pub min_score: f32,           // 默认 0.5(v0.11 起;此前不过滤)
     pub parallel: bool,           // 默认跟随 feature `parallel`
 }
 impl Default for CorrConfig;
@@ -1320,13 +1332,14 @@ impl Default for CorrConfig;
 | `max_image_levels` | `6` | 更慢,但大位移/缩放更稳 | **明显更快**,但目标跑太远会漏 | 已知目标只小幅移动,砍到 3~4 |
 | `beam_width` | `8` | 每层保留候选更多,更稳更慢 | 更快,但易丢正确候选 | 误报多→调大;追求延迟→调到 4 |
 | `roi_radius` | `8` | 精修范围大,更稳 | 更快,位移大时精修不到位 | 目标几乎不动→调到 4 |
-| `min_score` | 不过滤 | 更严(假命中少) | 更松 | 想过滤"勉强像"的结果,常取 0.6~0.8 |
+| `min_score` | `0.5` | 更严(假命中少) | 更松;`NEG_INFINITY`=完全不过滤 | 想过滤"勉强像"的结果,常取 0.6~0.8;要 v0.10 前的默认行为写 `NEG_INFINITY` |
 | `parallel` | 跟 feature | — | — | 见下方警告 |
 
 ⚠️ 三个必须知道的规则:
 
 1. **所有非法值都会被静默夹到安全下限**(而不是报错):`max_image_levels`/`beam_width`/`roi_radius`
-   最小 1;`min_score` 是 `NaN` 或负无穷 → 归为"不过滤",正无穷 → 钳到 `f32::MAX`(任何结果都不达标)。
+   最小 1;`min_score` 是 `NaN` → 原样保留(与任何分数比较都是 false,门槛不生效、结果照常返回),
+   负无穷 → 保持"不过滤",正无穷 → 钳到 `f32::MAX`(任何结果都不达标)。
    好处是"配错值不会静默找不到",坏处是你写错也收不到提醒。
 2. **`min_score` 是"最终结果"的阈值,在 pixhunt 侧把关,不会传给 corrmatch。**
    corrmatch 自己也有个同名参数,但那是**逐金字塔层**的候选门槛;粗筛层因为降采样吃掉了对比度,
@@ -1458,7 +1471,7 @@ pixhunt **不管鼠标**,点击交给生态库 [`enigo`](https://crates.io/crate
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.10", features = ["capture-dxgi"] }
+pixhunt = { version = "0.11", features = ["capture-dxgi"] }
 enigo = "0.6"
 ```
 
@@ -1622,7 +1635,7 @@ if let Some(b) = blobs.first() {
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.10", features = ["tracing"] }
+pixhunt = { version = "0.11", features = ["tracing"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 ```
@@ -1883,7 +1896,7 @@ cargo build --all-features
 能过就说明是 feature。把需要的写进 `Cargo.toml`:
 
 ```toml
-pixhunt = { version = "0.10", features = ["capture-dxgi", "match-corr"] }
+pixhunt = { version = "0.11", features = ["capture-dxgi", "match-corr"] }
 ```
 
 另一种典型:`error: expected 2 arguments` / 找不到 `Window` 变体 —— `CaptureKind::Window(..)`
@@ -2065,7 +2078,7 @@ Result<T> = std::result::Result<T, Error>
 ### 12.2 需要 feature 才有
 
 ```
-〔capture-gdi〕   GdiCapture::new_primary() -> GdiCapture;impl Capture(backend "gdi")
+〔capture-gdi〕   GdiCapture::new_primary() -> Result<GdiCapture>;impl Capture(backend "gdi")
 〔capture-dxgi〕  DxgiCapture::new_primary() -> Option<DxgiCapture>;impl Capture(backend "dxgi")
 〔capture-window〕WindowHandle = isize
                   WindowCapture::new(WindowHandle) -> WindowCapture
@@ -2124,7 +2137,7 @@ pixhunt::template   Template
 
 | 后端 | 选屏依据 | 能不能选别的屏 |
 | --- | --- | --- |
-| `GdiCapture` | `GetDC(NULL)` + `HORZRES/VERTRES` 的那一片(主显示器) | 不能;副屏与负坐标区不在画面里 |
+| `GdiCapture` | `CreateDC("DISPLAY")` + `HORZRES/VERTRES` 的那一片(主显示器;v0.11 起,此前是 `GetDC(NULL)`) | 不能;副屏与负坐标区不在画面里 |
 | `DxgiCapture` | `EnumAdapters(0)` + `EnumOutputs(0)` | 不能;多显卡(核显+独显)时这个顺序由驱动定,**不保证是主显示器** |
 | `XCapCapture`〔f:capture-xcap〕 | `primary()` 取主屏;`from_point(x, y)` 取坐标所在屏 | 能(唯一能按坐标选屏的全屏后端) |
 | `WindowCapture`〔f:capture-window〕 | 你递进来的 `HWND` | 能,且不受多屏影响(拿到的是客户区) |
@@ -2170,7 +2183,7 @@ pixhunt::template   Template
 
 ---
 
-## 版本迁移备忘(0.5 → 0.10)
+## 版本迁移备忘(0.5 → 0.11)
 
 | 从 | 到 | 破坏性变更 |
 | --- | --- | --- |
@@ -2181,6 +2194,7 @@ pixhunt::template   Template
 | v0.8.1 | v0.8.2 | **无破坏性变更**,且 `find_all` 的**命中集合与顺序逐个字节不变**(新增测试与朴素 O(n²) 参照逐字节对照)。变化是两件事:① 文档明写 `find_on_screen` / `Matcher::find` 在"命中不止一处"时只给 `(y, x)` 序第一个、**不告知还有第二处**,并给出唯一性守卫 `find_all_on_screen(tpl, 2)` 的写法(见 8.1.3);② `find_all` 的早停从"行"粒度细化到"列"粒度(覆盖判定前置 + 攒够 `max` 当场收工 + 整行/整块被覆盖就跳过),平坦画面再快一到四个数量级(1920x1200 纯色帧 + 8x8 `max=0`:串行 ~571ms → ~9.9ms;+ 240x80 `max=0`:串行 ~121s → ~6.6ms)。**唯一要当心的口径变化**:平坦画面上 `parallel` 不再比串行快;有纹理画面的 `find_all` 慢一点(1080p criterion 交替对拍:串行中位 3.99 → 4.17ms,parallel 2.59 → 2.82ms) |
 | v0.8.2 | v0.9 | **一个破坏面**:xcap 由硬依赖改成可选 feature `capture-xcap`(默认开)。写 `default-features = false` 的代码从此**一个截图后端都没有**——`CaptureKind::Monitor` 会编不过,只剩匹配核心(`Frame` / `Template` / `RgbMatcher` / 颜色搜索),帧要宿主自己注入(安卓就是这个用法);不写这行的桌面用户感受不变。同版还加了 `Template::load` 的 4000 万像素上限(超限返回 `ImageError::Limits`,见 8.4.2),以及修掉了 GDI 在分辨率变化那一帧画面错位/越界的 bug |
 | v0.9 | v0.10 | **一个破坏面**:`Template` 多了两个内部预计算字段,结构体字面量构造编不过(走 `load`/`from_rgb`/`from_rgba` 的写法**不受影响**;读字段也不受影响)。行为上:`RgbMatcher` 的预筛锚点从"中心+四角"改为模板构造时算好的一组(3~12 个、按鉴别力降序、互相不同色),`with_mask` 会重算它。命中集合与顺序**逐个不变**(真匹配处永远过得了预筛,预筛只能白比、不可能误杀;整窗验证一字未改)。变的只有速度,以及大容差下"活过预筛的错候选数" |
+| v0.10 | v0.11 | **三处破坏面**:① `GdiCapture::new_primary()` 从返回 `Self`(永不失败)改为返回 `Result<Self>`——无显示会话时如实报错,不再留下尺寸 0 的残废实例;GDI 内部改用 `CreateDC("DISPLAY")` 取代语义有争议的 `GetDC(NULL)`。② `find_until` / `wait_gone` 的 `interval` 传 `Duration::ZERO` 从此直接返回 `Err`(此前是全速自旋能打满单核),要极限节奏请自己拿 `find_on_screen` 组循环。③ `CorrConfig::min_score` 默认从 `NEG_INFINITY`(不过滤)改为 `0.5`,低置信假命中被挡在门外;要旧行为显式写 `NEG_INFINITY`。另外 `WindowCapture::grab`/`grab_into` 抓取前加 `IsWindow` 前置校验,句柄失效返回明确 `Err`(纯新增,非破坏) |
 
 ## 许可
 
@@ -2189,6 +2203,9 @@ MIT OR Apache-2.0。
 > 本说明书内容由 AI 编码助手依据 **pixhunt 0.8.2 的实际源码**逐个 API 清点后撰写;
 > **0.10.0** 这一版重新对照源码清点过全部对外 API(第 7、12 章的名单与 `src/` 里的
 > `pub` 项逐个对得上,无遗漏无多余),并按 0.10 的行为改写过 1、8.1.6、8.1.7、8.4、
-> 8.6.2、9.8、12.6 与本节迁移表。**第 10 章的性能数字大多仍是 0.8.x 时代测的**,
+> 8.6.2、9.8、12.6 与本节迁移表。**0.11.0** 这一版对照源码同步了三处破坏面(GDI
+> `CreateDC("DISPLAY")` + `new_primary` 改 `Result`、`interval` 传 `ZERO` 报错、
+> `CorrConfig::min_score` 默认 `0.5`)与窗口句柄前置校验,改写了 8.1.6、8.1.7、8.5.3、
+> 8.7.1、12.5 与本节迁移表。**第 10 章的性能数字大多仍是 0.8.x 时代测的**,
 > 那里逐张表标注了出处版本。不保证逐行经过人工细读;若你升级了版本,请以
 > `cargo doc --no-deps --open` 生成的最新文档和源码为准。

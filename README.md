@@ -57,12 +57,12 @@ if let Some(m) = finder.find_on_screen(&tpl)? {
 
 ```toml
 [dependencies]
-pixhunt = { version = "0.10", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
+pixhunt = { version = "0.11", features = ["capture-dxgi", "capture-gdi", "match-corr", "parallel"] }
 ```
 
 启用后 `CaptureKind` 多出 `Gdi` / `Dxgi` / `Auto`(`Auto` 依次试 DXGI → GDI → xcap;
-GDI 的构造不返回错误,所以开了 `capture-gdi` 就永远走不到 xcap 那一档),
-`MatchKind` 多出 `Corr`:
+v0.11 起 GDI 构造也可能失败,所以三档每档都能下抛回退,只是显示会话正常时通常仍停在
+GDI),`MatchKind` 多出 `Corr`:
 
 ```rust
 let mut finder = Finder::builder()
@@ -238,7 +238,7 @@ let m = finder.find_on_screen(&Template::load("btn.png")?)?;
 | `max_image_levels` | 6 | 粗筛更便宜 / 大位移、轻微缩放更稳 |
 | `beam_width` | 8 | 每层候选更少更快 / 遮挡、伪峰多时更稳 |
 | `roi_radius` | 8 | 精修扫描范围更小更快 / 容忍层间位移误差更大 |
-| `min_score` | 不过滤 | 误命中更少(注意会漏判) |
+| `min_score` | 0.5(v0.11 起) | 误命中更少(注意会漏判);要旧版"不过滤"写 `f32::NEG_INFINITY` |
 | `parallel` | 跟随 `parallel` feature | — |
 
 要点:
@@ -249,6 +249,60 @@ let m = finder.find_on_screen(&Template::load("btn.png")?)?;
 - `min_score` 是**最终结果**的阈值,在 pixhunt 侧把关,不传给 corrmatch。corrmatch 自己的
   同名字段是**逐金字塔层**的候选门槛,而粗筛层分数天然偏低,拿它当最终阈值会把真命中
   整条链路削空。
+
+## v0.11 变更
+
+次版本号级别,含**三处破坏性改动**(见下面"升级到 v0.11")。来源是一轮对抗式审查,
+逐条核验后落地 —— 审查清单里另有两条**没有采纳**,理由写在最后。
+
+修复 / 加固:
+
+- **GDI 后端:构造可上抛 + 显式绑定主屏**。`FastCap::new_primary` 此前 `GetDC(NULL)`
+  不判空、`GdiCapture::new_primary()` 返回 `Self`,锁屏/无显示会话下会静默造出一个
+  尺寸为 0 的残废实例;`CaptureKind::Auto` 因此"GDI 永不失败",永远回退不到 xcap。
+  现在改用 `CreateDCW("DISPLAY")`(官方定义即"显示驱动 = 主显示器",不再依赖
+  `GetDC(NULL)` 在 Windows 10 2004+ 上有争议的覆盖范围),`GetDC`/`CreateCompatibleDC`/
+  `CreateCompatibleBitmap` 逐一判空,`new_primary() -> Result<Self>`,`Auto` 三档
+  DXGI → GDI → xcap 每档都可能失败下抛。⚠️ 多屏机器上"旧代码到底抓没抓错屏"**本机
+  单屏无法复现**,本次是把取屏方式改成语义无歧义的写法,不是实测坐实了旧 bug。
+- **轮询:`interval = Duration::ZERO` 从"全速自旋"改为显式 `Err`**。旧行为合法但后果是
+  永不退出、100% 打满单核的高频截屏(配合 `timeout = Duration::MAX`)。现在
+  `find_until` / `wait_gone` 在入口直接返回 `Error::Capture`,**一帧都不拍**(mock 数
+  拍帧次数钉住)。要极限节奏就自己拿 `find_on_screen` 组循环。
+- **ZNCC:`CorrConfig::min_score` 默认从"不过滤"改为 `0.5`**。ZNCC 在**没有目标的画面上
+  也会给出一个峰值**(噪声帧实测 < 0.4),不过滤时 `find_on_screen` 把 0.05 的"勉强像"
+  照常返回 `Some`,与真命中无法区分。新增回归测试:同一模板在"有目标/无目标"两帧上,
+  默认配置必须分别给 `Some`/`None`,而无门槛配置能同时看到两者分数。
+- **`WindowCapture` 句柄失效早失败**:窗口销毁后旧写法要多绕几步(PrintWindow 返 0 →
+  "PrintWindow failed",或客户区已 0 → "empty client area (minimized?)"),文案把
+  "目标没了"误导成"等等就好"。现在 `grab` / `grab_into` 入口先 `IsWindow`,报
+  "window handle invalid (destroyed?)"。有真建真毁隐藏窗口的单测钉住文案。
+- **`Template::from_rgb` / `from_rgba` 的巨图提示**:`MAX_TEMPLATE_PIXELS` 此前只在
+  `load` 把关(它面对的是外部文件),内存构造入口不设硬上限(会破坏语义),但 debug
+  构建下超过 4000 万像素会 `debug_assert` 炸出提示——锚点预计算是 O(w·h) 全量遍历,
+  误传尺寸时应立刻看见,而不是慢得莫名其妙。
+
+未采纳的审查建议(记录理由):
+
+- "给 `XCapCapture` 覆写 `grab_into` 消掉每帧分配"——v0.8 期**实测过是负收益**(省
+  ~0.006ms 分配、多付 ~0.8ms 整帧 memcpy),xcap 也没有"写进调用方缓冲"的接口。已在
+  `XCapCapture` 文档里把这一取舍写明,高频轮询请直接用 GDI/DXGI/Window。
+- "把 `ACQUIRE_TIMEOUT_MS`、默认 tolerance 暴露到配置项"——公开 API 面积换不来对应
+  收益,常量本身已是模块内常量化的好实践。
+
+## 升级到 v0.11 (breaking)
+
+| v0.10 | v0.11 |
+| --- | --- |
+| `GdiCapture::new_primary()` 返回 `GdiCapture` | 返回 **`Result<GdiCapture>`**;调用点加 `.unwrap()` / `?` 即可(显示会话不可用时现在是错误,不是残废实例) |
+| `find_until` / `wait_gone` 传 `interval = Duration::ZERO` 时圈间不睡、全速轮询 | 直接返回 `Err(Error::Capture)`。要"只看一眼"请写 `timeout = Duration::ZERO`(仍然只拍一帧);要极限节奏自己拿 `find_on_screen` 组循环 |
+| `CorrMatcher::new()` / `CorrConfig::default()` 的 `min_score` 不过滤,任何分数都返回 `Some` | 默认门槛 **0.5**,低于它的按未命中。要旧行为显式写 `min_score: f32::NEG_INFINITY`;要更稳写 0.7+ |
+| `WindowCapture` 对已销毁窗口报"PrintWindow failed"/"empty client area" | 报 **"window handle invalid (destroyed?)"**。按错误**文案**分支的调用方需要跟一下 |
+
+其余不变:命中集合、`(y, x)` 顺序、`score` 语义、`tolerance` 语义、各 feature 组合的
+可编译性均与 v0.10 一致。**坐标口径**在单屏/主屏上与 v0.10 一致;⚠️ 多显示器机器上
+`Gdi` / `Auto` 的帧尺寸与原点可能因取屏方式从 `GetDC(NULL)` 改为 `CreateDC("DISPLAY")`
+而变化(旧代码到底抓哪块屏本机单屏无法复现,未实测),若你在多屏上用 GDI 后端请回归验证。
 
 ## v0.10 变更
 
@@ -337,7 +391,8 @@ crate 自带 bench 的口径(同一台机器,HEAD 快照与改动版**交替**�
   等很久时,这是唯一能区分"还在转"和"已经卡死"的东西;不开 feature `tracing` 时整块不
   参与编译,连轮次计数都不存在。
 - 把三件事写明了(代码早就如此,只是没写在脸上):`timeout` **没有任何上限**,写多久就等
-  多久;`Duration::ZERO` 是只看一眼(`interval` 传 ZERO 是圈间不额外睡);轮询中**没有中途
+  多久;`Duration::ZERO` 是只看一眼(`interval` 传 ZERO 曾是"圈间不额外睡",**v0.11 起改为
+  直接报 `Err`**,见"升级到 v0.11");轮询中**没有中途
   叫停的通道**——只有"命中""到点""截图报错"三个出口,要"等很久又能随时收手"得自己拿
   `find_on_screen` 组循环。`docs/GUIDE.md` 开头那句"等一个按钮出现(最多等 10 秒)"是把
   示例当上限写了,已改;依赖示例里残留的 `0.9` 也全部跟到 `0.10`。
@@ -529,7 +584,11 @@ cargo run --release --features capture-dxgi,capture-gdi --example find_on_screen
 ```
 
 ## 注意
-- **分辨率 / DPI**:模板与截图需同一分辨率尺度,否则找不到。
+- **分辨率 / DPI**:所有帧尺寸与命中坐标一律是**物理像素**,库不做 DPI 感知与换算。
+  模板必须与运行时**同后端、同缩放倍率**截取(浏览器 150% 缩放里存的素材对不上 100%
+  物理像素的屏幕帧);命中坐标要交给 `SetCursorPos` 等逻辑坐标 API 时,调用方自行按
+  目标显示器的倍率换算。混合 DPI 多屏下各后端绑定的显示器与原点也不一致,见下面
+  "多显示器"一节。
 - **文档**:`cargo doc --no-deps --open` 看完整 API 注释。**docs.rs 上本 crate 的构建目前是
   失败的**(`pixhunt-0.8.0` 在 docs.rs 的 builds 页显示 failed):原因是要编译依赖 `xcap`,
   而 `xcap` 的构建脚本需要系统库(libclang / PipeWire headers 等),docs.rs 环境没有这些包,
@@ -541,7 +600,9 @@ cargo run --release --features capture-dxgi,capture-gdi --example find_on_screen
   编译需要:`pkg-config libclang-dev libxcb1-dev libxrandr-dev libdbus-1-dev
   libpipewire-0.3-dev libwayland-dev libegl-dev libgbm-dev`(本仓库 CI 已按此配置)。
   缺失时报的是链接错误(如 `unable to find library -lgbm`),不是编译错误。
-- **多显示器**:`Gdi` 只覆盖主显示器;`Dxgi` 取的是 `EnumAdapters(0)` + `EnumOutputs(0)`,
+- **多显示器**:`Gdi` 经 `CreateDC("DISPLAY")` 只覆盖主显示器(v0.11 起显式绑定;此前用
+  `GetDC(NULL)`,其在 Windows 10 2004+ 的覆盖范围存在版本争议);`Dxgi` 取的是
+  `EnumAdapters(0)` + `EnumOutputs(0)`,
   单显卡时那就是主屏,多显卡(核显 + 独显)时**不保证**;`Monitor`(xcap)默认也取主屏。
   要抓副屏,用 `XCapCapture::from_point(x, y)`(按屏幕坐标落在哪块屏来选显示器),再交给
   `Finder::new(Box::new(cap), ...)`;或者用 `WindowCapture` 直接盯那个窗口。

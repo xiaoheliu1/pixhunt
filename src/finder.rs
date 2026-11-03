@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 /// 关掉 feature 时它只是个没人看的常量,不占也不花什么。
 const POLL_PROGRESS: Duration = Duration::from_secs(5);
 
-#[cfg(all(windows, feature = "capture-dxgi"))]
 use crate::Error;
 
 #[cfg(feature = "match-corr")]
@@ -228,6 +227,11 @@ impl Finder {
     /// - 大到加不进当前时刻的值(典型入参 [`Duration::MAX`])视为**永不超时**,不会 panic;
     /// - [`Duration::ZERO`] 是**只看一眼**——仍会截一帧、找一次,没命中就立刻返回 `None`。
     ///
+    /// `interval` 必须是**非零**间隔:传 [`Duration::ZERO`] 会得到
+    /// [`Error::Capture`](v0.11 起;此前它是"圈间不额外睡"的全速自旋,能把单核打满)。
+    /// 确实要"截到屏幕刷不动为止"的极限节奏,按文档自己拿
+    /// [`Finder::find_on_screen`] 组循环,节流责任回到调用方。
+    ///
     /// ⚠️ 一旦进来就**没有中途叫停的通道**:只有"命中""到点""截图报错"三个出口,期间
     /// 既没有回调也读不到任何外部标志(想按个键就收手、想让取消生效,这里做不到)。
     /// 等得又久又要能随时停,就别用它:自己拿 [`Finder::find_on_screen`] 组循环,每圈去问
@@ -256,6 +260,7 @@ impl Finder {
     ///
     /// 同 [`Finder::find_until`]:超大的 `timeout`(如 `Duration::MAX`)视为永不超时,
     /// `Duration::ZERO` 是只看一眼(仍会拍一次,还在 = `false`,不见了 = `true`);
+    /// `interval` 传 [`Duration::ZERO`] 直接返回 [`Error::Capture`](与 `find_until` 同);
     /// 同样**没有中途叫停的通道**,想能停就自己组循环;开 `tracing` 时同样是每 5 秒
     /// 检查一次进度(`interval` 大于 5 秒时每轮一条)。
     pub fn wait_gone(
@@ -284,6 +289,11 @@ impl Finder {
     ///   [`POLL_PROGRESS`] = 5 秒)。要真能中断,调用方自己
     ///   拿 [`Finder::find_on_screen`] 组循环,不要把长等待交给这里。
     ///
+    /// `interval == Duration::ZERO` 在入口就被拒掉:曾经它是"圈间不额外睡",
+    /// 配合不超时的 `timeout` 就是永不退出、100% 打满单核的自旋(合法的 `Duration`
+    /// 入参不该有这种后果)。v0.11 起返回 [`Error::Capture`],极限节奏请自己组
+    /// [`Finder::find_on_screen`] 循环。
+    ///
     /// 阈值是个入参而不是直接读常量,为的是能【当场验】那条 trace 真发得出来:
     /// 留在常量里就得让测试真跑满 5 秒。
     fn poll(
@@ -294,6 +304,11 @@ impl Finder {
         want_hit: bool,
         progress_every: Duration,
     ) -> Result<Option<Match>> {
+        if interval.is_zero() {
+            return Err(Error::capture(
+                "poll interval must be non-zero; for max-rate polling loop find_on_screen yourself",
+            ));
+        }
         // 不开 tracing 时这个参数没人看,拿一下免得报"参数未使用"。
         #[cfg(not(feature = "tracing"))]
         let _ = progress_every;
@@ -667,7 +682,7 @@ impl FinderBuilder {
             #[cfg(feature = "capture-xcap")]
             CaptureKind::Monitor => Box::new(XCapCapture::primary()?),
             #[cfg(all(windows, feature = "capture-gdi"))]
-            CaptureKind::Gdi => Box::new(crate::capture_gdi::GdiCapture::new_primary()),
+            CaptureKind::Gdi => Box::new(crate::capture_gdi::GdiCapture::new_primary()?),
             #[cfg(all(windows, feature = "capture-dxgi"))]
             CaptureKind::Dxgi => Box::new(
                 crate::capture_dxgi::DxgiCapture::new_primary()
@@ -698,29 +713,40 @@ impl FinderBuilder {
 
 /// 依次尝试 DXGI → GDI → xcap,返回第一个可用的。
 ///
-/// 注:只要 `capture-gdi` 编进来了就永远走不到 xcap 那一档——GDI 的构造不返回错误,
-/// 拿到就用。后面两档因此各带一个 `#[allow(unreachable_code)]`:它们只在"没编进 GDI"
-/// 的组合里是活路(例如 `--no-default-features --features capture-dxgi,capture-xcap`)。
+/// 三档现在都可能失败:`build()` 会把失败上抛(不会悄悄留下一个抓不到画面的
+/// 残废实例),下一档因此真的可达。注:默认 feature 组合下只要 `capture-gdi`
+/// 编进来且显示会话正常,通常仍走不到 xcap 那一档。
 #[cfg(all(windows, any(feature = "capture-gdi", feature = "capture-dxgi")))]
 fn auto_capture() -> Result<Box<dyn Capture>> {
     #[cfg(feature = "capture-dxgi")]
     if let Some(c) = crate::capture_dxgi::DxgiCapture::new_primary() {
         return Ok(Box::new(c));
     }
-    #[cfg(feature = "capture-gdi")]
-    {
-        // GDI 的构造不返回错误,所以它之后那些分支只在没编进 GDI 时才是活路。
-        return Ok(Box::new(crate::capture_gdi::GdiCapture::new_primary()));
+    // gdi + xcap 同编:GDI 成功就早返回,失败则往下落到 xcap。
+    #[cfg(all(feature = "capture-gdi", feature = "capture-xcap"))]
+    if let Ok(c) = crate::capture_gdi::GdiCapture::new_primary() {
+        return Ok(Box::new(c));
     }
-    // `allow` 必须挂在**块语句**上:rustc 1.98 起判为不可达的是这一块本身,而不是块里
-    // 那条 `return` —— 属性原先写在 return 前面,盖不住,`-D warnings` 下直接报错。
+    // 下面三个块互斥,编译期恰好剩一个当尾表达式(不用 return,免得 needless_return;
+    // 也不能全都编,否则后两个会 unreachable)。
     #[cfg(feature = "capture-xcap")]
-    #[allow(unreachable_code)]
     {
-        return Ok(Box::new(XCapCapture::primary()?));
+        Ok(Box::new(XCapCapture::primary()?))
     }
-    #[allow(unreachable_code)]
-    Err(crate::Error::capture("no capture backend available"))
+    // 有 gdi 但没 xcap:GDI 是最后一档,失败原因(如 CreateDC)直接用 map/? 上抛,
+    // 而不是谎报"没有后端"。
+    #[cfg(all(feature = "capture-gdi", not(feature = "capture-xcap")))]
+    {
+        crate::capture_gdi::GdiCapture::new_primary()
+            .map(|c| Box::new(c) as Box<dyn Capture>)
+    }
+    // 只剩 DXGI 一档(既没 gdi 也没 xcap)时才会走到这里。
+    #[cfg(not(any(feature = "capture-gdi", feature = "capture-xcap")))]
+    {
+        Err(crate::Error::capture(
+            "no capture backend available (only DXGI was compiled and it found no adapter)",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -911,6 +937,30 @@ mod tests {
             .expect("mock 不会出错");
         assert!(!gone, "目标就在屏上,\"不见了\"只能是假");
         assert_eq!(n.get(), 1, "同理:只看一眼");
+    }
+
+    /// 回归:`interval = ZERO` 曾经是"圈间不额外睡"的全速自旋(合法入参打出 100%
+    /// 单核)。v0.11 起必须是显式 `Err`,且**一帧都不拍**——拍次数为 0 才证明它真的
+    /// 在入口就返回,而不是"进循环转了几圈才报错"。两条公开入口都要钉住。
+    #[test]
+    fn zero_interval_errors_without_grabbing() {
+        let (cap, n) = counter_cap(false);
+        let mut f = Finder::new(cap, Box::new(RgbMatcher::new(0)));
+        let err = f
+            .find_until(&target_tpl(), Duration::from_millis(30), Duration::ZERO)
+            .expect_err("ZERO interval 应报错");
+        assert!(n.get() == 0, "应在入口就返回,不该拍任何一帧,grabs={}", n.get());
+        let text = err.to_string();
+        assert!(text.contains("interval"), "错误信息要指向 interval: {text}");
+
+        let (cap2, n2) = counter_cap(true);
+        let mut f2 = Finder::new(cap2, Box::new(RgbMatcher::new(0)));
+        assert!(
+            f2.wait_gone(&target_tpl(), Duration::from_millis(30), Duration::ZERO)
+                .is_err(),
+            "wait_gone 同口径"
+        );
+        assert_eq!(n2.get(), 0, "同理一帧都不拍");
     }
 
     /// 上一轮只能证明"开了 feature 能编译",这条证明**真收得到**:阈值压到 2 毫秒、
